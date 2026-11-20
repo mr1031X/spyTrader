@@ -59,6 +59,8 @@ class BotSettings(BaseModel):
     enabled_strategies: list[str] = Field(
         default_factory=lambda: ["momentum_breakout", "trend_continuation", "vwap_reversal"]
     )
+    experiment_breakout_3_atr_enabled: bool = False
+    experiment_confirmed_continuation_enabled: bool = False
     score_weights: ScoreWeights = Field(default_factory=ScoreWeights)
     options_provider: Literal["alpaca", "tradier"] = "alpaca"
     max_quote_age_seconds: float = Field(3, gt=0, le=60)

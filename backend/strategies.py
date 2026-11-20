@@ -105,7 +105,7 @@ def _event_key(frame: pd.DataFrame, setup: str) -> str:
 
 
 def _breakout_detail(underlying: str, one: pd.DataFrame, five: pd.DataFrame,
-                     opening_minutes: int) -> StrategyEvaluation:
+                     opening_minutes: int, extension_limit: float = 2.5) -> StrategyEvaluation:
     evaluation = StrategyEvaluation("momentum_breakout")
     i1 = compute_indicators(one, opening_minutes)
     i5 = compute_indicators(five, opening_minutes)
@@ -133,7 +133,7 @@ def _breakout_detail(underlying: str, one: pd.DataFrame, five: pd.DataFrame,
             current["close"] < current["open"] and previous["close"] <= previous["open"])
         evaluation.conditions.update({
             "ema_alignment": ema_aligned, "vwap_alignment": vwap_aligned,
-            "not_overextended": extension <= 2.5, "candle_confirmation": confirmation,
+            "not_overextended": extension <= extension_limit, "candle_confirmation": confirmation,
             "atr_expansion": i1.volatility_ratio >= 0.75,
         })
         for condition, code in (
@@ -245,6 +245,87 @@ def trend_continuation(underlying: str, one: pd.DataFrame, five: pd.DataFrame,
     return _continuation_detail(underlying, one, five, opening_minutes).candidate
 
 
+def _confirmed_continuation_detail(underlying: str, one: pd.DataFrame, five: pd.DataFrame,
+                                   opening_minutes: int) -> StrategyEvaluation:
+    evaluation = StrategyEvaluation("confirmed_trend_continuation")
+    i1 = compute_indicators(one, opening_minutes)
+    i5 = compute_indicators(five, opening_minutes)
+    evaluation.trend = classify_trend(i5)
+    evaluation.volatility = classify_volatility(i5)
+    direction: Direction | None = None
+    if i5.ema9 > i5.ema21 > i5.ema50:
+        direction = "call"
+    elif i5.ema9 < i5.ema21 < i5.ema50:
+        direction = "put"
+    evaluation.direction = direction
+    evaluation.conditions["ema_alignment"] = direction is not None
+    if direction is None:
+        evaluation.rejected.extend(["EMA_MISALIGNMENT", "REGIME_MISMATCH"])
+        return evaluation
+    bullish = direction == "call"
+    established = evaluation.trend in ({"moderate bullish", "strong bullish"} if bullish else
+                                       {"moderate bearish", "strong bearish"})
+    evaluation.conditions["established_trend"] = established
+    if not established:
+        evaluation.rejected.append("REGIME_MISMATCH")
+        return evaluation
+    current = one.iloc[-1]
+    previous = one.iloc[-2]
+    consolidation = five.iloc[-5:-1]
+    consolidation_range = float(consolidation["high"].max() - consolidation["low"].min())
+    local_dates = consolidation["timestamp"].dt.tz_convert("America/New_York").dt.date
+    current_date = pd.Timestamp(current["timestamp"]).tz_convert("America/New_York").date()
+    intervals = consolidation["timestamp"].diff().dropna()
+    completed = (
+        len(consolidation) == 4 and bool((local_dates == current_date).all())
+        and bool((intervals == pd.Timedelta(minutes=5)).all())
+        and consolidation_range <= i5.atr * 1.8
+    )
+    boundary = float(consolidation["high"].max() if bullish else consolidation["low"].min())
+    fresh_trigger = (
+        current["close"] > boundary and previous["close"] <= boundary if bullish else
+        current["close"] < boundary and previous["close"] >= boundary
+    )
+    momentum = i1.macd_histogram > 0 if bullish else i1.macd_histogram < 0
+    candle = current["close"] > current["open"] if bullish else current["close"] < current["open"]
+    extension = abs(i1.price - i1.vwap) / i1.atr
+    evaluation.conditions.update({
+        "vwap_alignment": i1.price > i1.vwap if bullish else i1.price < i1.vwap,
+        "completed_consolidation": completed,
+        "relative_volume": i1.relative_volume >= 0.8,
+        "not_overextended": extension <= 2.5,
+        "confirmed_directional_trigger": fresh_trigger and momentum and candle,
+        "fresh_entry_location": abs(float(current["close"]) - boundary) <= i1.atr * 0.5,
+    })
+    for condition, code in (
+        ("vwap_alignment", "VWAP_MISALIGNMENT"),
+        ("completed_consolidation", "CONSOLIDATION_NOT_CONFIRMED"),
+        ("relative_volume", "INSUFFICIENT_VOLUME"),
+        ("not_overextended", "OVEREXTENDED_PRICE"),
+        ("confirmed_directional_trigger", "CONTINUATION_NOT_CONFIRMED"),
+        ("fresh_entry_location", "ENTRY_LOCATION_TOO_EXTENDED"),
+    ):
+        if not evaluation.conditions[condition]:
+            evaluation.rejected.append(code)
+    if evaluation.rejected:
+        return evaluation
+    evaluation.candidate = SignalCandidate(
+        underlying, direction, "confirmed_trend_continuation", evaluation.trend,
+        {"momentum": _momentum(i1, direction), "trend": _trend(i5, direction),
+         "volume": min(i1.relative_volume / 2.0, 1.0), "volatility": _volatility_score(i1, 1.0)},
+        ["Established EMA and VWAP trend", "Four completed same-session five-minute candles formed a consolidation",
+         "Closed candle produced a fresh directional consolidation break without chasing"],
+        i1.price, i1.atr, trend=evaluation.trend, volatility=evaluation.volatility,
+        event_key=_event_key(one, "confirmed-consolidation"),
+    )
+    return evaluation
+
+
+def confirmed_trend_continuation(underlying: str, one: pd.DataFrame, five: pd.DataFrame,
+                                 opening_minutes: int) -> SignalCandidate | None:
+    return _confirmed_continuation_detail(underlying, one, five, opening_minutes).candidate
+
+
 def _vwap_detail(underlying: str, one: pd.DataFrame, five: pd.DataFrame,
                  opening_minutes: int) -> StrategyEvaluation:
     evaluation = StrategyEvaluation("vwap_reversal")
@@ -305,37 +386,50 @@ class StrategyEngine:
         "momentum_breakout": momentum_breakout,
         "trend_continuation": trend_continuation,
         "vwap_reversal": vwap_reversal,
+        "confirmed_trend_continuation": confirmed_trend_continuation,
     }
     DETAILED = {
         "momentum_breakout": _breakout_detail,
         "trend_continuation": _continuation_detail,
         "vwap_reversal": _vwap_detail,
+        "confirmed_trend_continuation": _confirmed_continuation_detail,
     }
 
     def evaluate_detailed(self, underlying: str, one: pd.DataFrame, five: pd.DataFrame, fifteen: pd.DataFrame,
                           enabled: list[str], opening_minutes: int = 15,
-                          news_unstable: bool = False) -> list[StrategyEvaluation]:
+                          news_unstable: bool = False, experiment_breakout_3_atr: bool = False,
+                          experiment_confirmed_continuation: bool = False) -> list[StrategyEvaluation]:
         one = filter_regular_session(one)
         five = filter_regular_session(five)
         fifteen = filter_regular_session(fifteen)
+        names = list(enabled)
+        if experiment_confirmed_continuation and "confirmed_trend_continuation" not in names:
+            names.append("confirmed_trend_continuation")
         results = []
-        for name in enabled:
+        for name in names:
             function = self.DETAILED.get(name)
             if not function:
                 continue
             if len(one) < 60 or len(five) < 55 or len(fifteen) < 55:
                 results.append(StrategyEvaluation(name, rejected=["INSUFFICIENT_HISTORICAL_DATA"]))
                 continue
-            evaluation = function(underlying, one, five, opening_minutes)
+            if name == "momentum_breakout":
+                evaluation = function(underlying, one, five, opening_minutes,
+                                      extension_limit=3.0 if experiment_breakout_3_atr else 2.5)
+            else:
+                evaluation = function(underlying, one, five, opening_minutes)
             i15 = compute_indicators(fifteen, opening_minutes)
             trend = classify_trend(i15)
             volatility = classify_volatility(i15, news_unstable)
             evaluation.trend = trend
             evaluation.volatility = volatility
             if evaluation.candidate is not None:
+                expected_trends = ({"moderate bullish", "strong bullish"} if evaluation.candidate.direction == "call"
+                                   else {"moderate bearish", "strong bearish"})
                 compatible = not (
                     volatility == "extreme" or
                     (name == "trend_continuation" and trend == "sideways") or
+                    (name == "confirmed_trend_continuation" and trend not in expected_trends) or
                     (name == "momentum_breakout" and volatility == "low")
                 )
                 if compatible:
@@ -350,7 +444,10 @@ class StrategyEngine:
         return results
 
     def evaluate(self, underlying: str, one: pd.DataFrame, five: pd.DataFrame, fifteen: pd.DataFrame,
-                 enabled: list[str], opening_minutes: int = 15, news_unstable: bool = False) -> list[SignalCandidate]:
+                 enabled: list[str], opening_minutes: int = 15, news_unstable: bool = False,
+                 experiment_breakout_3_atr: bool = False,
+                 experiment_confirmed_continuation: bool = False) -> list[SignalCandidate]:
         return [item.candidate for item in self.evaluate_detailed(
             underlying, one, five, fifteen, enabled, opening_minutes, news_unstable,
+            experiment_breakout_3_atr, experiment_confirmed_continuation,
         ) if item.candidate is not None]

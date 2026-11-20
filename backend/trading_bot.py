@@ -400,6 +400,8 @@ class TradingBot:
                 evaluations = self.strategy.evaluate_detailed(
                     symbol, one, five, fifteen, settings.enabled_strategies,
                     settings.opening_range_minutes, news.unstable,
+                    experiment_breakout_3_atr=settings.experiment_breakout_3_atr_enabled,
+                    experiment_confirmed_continuation=settings.experiment_confirmed_continuation_enabled,
                 ) if underlying_ready else []
                 payload["strategies"] = [item.to_dict() for item in evaluations]
                 payload["trend"] = evaluations[0].trend if evaluations else "unknown"

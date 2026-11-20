@@ -1,0 +1,198 @@
+{
+  "replay_type": "underlying",
+  "symbols": [
+    {
+      "underlying": "QQQ",
+      "scans": 685,
+      "strategy_evaluations": 2055,
+      "candidates": 1,
+      "bullish_candidates": 0,
+      "bearish_candidates": 1,
+      "technical_threshold_met": 0,
+      "rejected_evaluations": 2054,
+      "rejected_candidates": 1,
+      "rejection_counts": {
+        "BREAKOUT_NOT_CONFIRMED": 682,
+        "CONTINUATION_NOT_CONFIRMED": 394,
+        "VWAP_MISALIGNMENT": 751,
+        "INSUFFICIENT_VOLUME": 825,
+        "MOMENTUM_NOT_CONFIRMED": 14,
+        "FAILED_RETEST_NOT_CONFIRMED": 11,
+        "REGIME_MISMATCH": 81,
+        "NO_PULLBACK_OR_FAILED_RETEST": 47,
+        "TREND_STRUCTURE_MISSING": 259,
+        "EMA_MISALIGNMENT": 83,
+        "OVEREXTENDED_PRICE": 511,
+        "SIGNAL_SCORE_TOO_LOW": 1
+      },
+      "threshold_comparison": {
+        "70": 1,
+        "80": 0,
+        "90": 0
+      },
+      "last_candidate": {
+        "timestamp": "2026-11-20T14:41:00+00:00",
+        "underlying": "QQQ",
+        "strategy": "trend_continuation",
+        "direction": "put",
+        "trend": "strong bearish",
+        "volatility": "normal",
+        "technical_score": 74.69,
+        "raw_technical_points": 59.75,
+        "threshold_met": false,
+        "rejection_reason": "SIGNAL_SCORE_TOO_LOW",
+        "final_decision": "TECHNICAL_REJECTED"
+      },
+      "primary_rejections": [
+        {
+          "reason": "INSUFFICIENT_VOLUME",
+          "count": 825
+        },
+        {
+          "reason": "VWAP_MISALIGNMENT",
+          "count": 751
+        },
+        {
+          "reason": "BREAKOUT_NOT_CONFIRMED",
+          "count": 682
+        },
+        {
+          "reason": "OVEREXTENDED_PRICE",
+          "count": 511
+        },
+        {
+          "reason": "CONTINUATION_NOT_CONFIRMED",
+          "count": 394
+        },
+        {
+          "reason": "TREND_STRUCTURE_MISSING",
+          "count": 259
+        },
+        {
+          "reason": "EMA_MISALIGNMENT",
+          "count": 83
+        },
+        {
+          "reason": "REGIME_MISMATCH",
+          "count": 81
+        }
+      ]
+    },
+    {
+      "underlying": "SPY",
+      "scans": 685,
+      "strategy_evaluations": 2055,
+      "candidates": 1,
+      "bullish_candidates": 0,
+      "bearish_candidates": 1,
+      "technical_threshold_met": 0,
+      "rejected_evaluations": 2054,
+      "rejected_candidates": 1,
+      "rejection_counts": {
+        "BREAKOUT_NOT_CONFIRMED": 681,
+        "TREND_STRUCTURE_MISSING": 315,
+        "CONTINUATION_NOT_CONFIRMED": 443,
+        "NO_PULLBACK_OR_FAILED_RETEST": 53,
+        "VWAP_MISALIGNMENT": 769,
+        "INSUFFICIENT_VOLUME": 803,
+        "MOMENTUM_NOT_CONFIRMED": 10,
+        "FAILED_RETEST_NOT_CONFIRMED": 2,
+        "OVEREXTENDED_PRICE": 574,
+        "EMA_MISALIGNMENT": 19,
+        "REGIME_MISMATCH": 15,
+        "SIGNAL_SCORE_TOO_LOW": 1
+      },
+      "threshold_comparison": {
+        "70": 1,
+        "80": 0,
+        "90": 0
+      },
+      "last_candidate": {
+        "timestamp": "2026-11-20T15:17:00+00:00",
+        "underlying": "SPY",
+        "strategy": "vwap_reversal",
+        "direction": "put",
+        "trend": "strong bearish",
+        "volatility": "normal",
+        "technical_score": 79.21,
+        "raw_technical_points": 63.37,
+        "threshold_met": false,
+        "rejection_reason": "SIGNAL_SCORE_TOO_LOW",
+        "final_decision": "TECHNICAL_REJECTED"
+      },
+      "primary_rejections": [
+        {
+          "reason": "INSUFFICIENT_VOLUME",
+          "count": 803
+        },
+        {
+          "reason": "VWAP_MISALIGNMENT",
+          "count": 769
+        },
+        {
+          "reason": "BREAKOUT_NOT_CONFIRMED",
+          "count": 681
+        },
+        {
+          "reason": "OVEREXTENDED_PRICE",
+          "count": 574
+        },
+        {
+          "reason": "CONTINUATION_NOT_CONFIRMED",
+          "count": 443
+        },
+        {
+          "reason": "TREND_STRUCTURE_MISSING",
+          "count": 315
+        },
+        {
+          "reason": "NO_PULLBACK_OR_FAILED_RETEST",
+          "count": 53
+        },
+        {
+          "reason": "EMA_MISALIGNMENT",
+          "count": 19
+        }
+      ]
+    }
+  ],
+  "evaluation_start": "2026-11-19T00:00:00+00:00",
+  "evaluation_end": "2026-11-20T18:48:29.135692+00:00",
+  "underlying_bars": 6939,
+  "scans_completed": 1370,
+  "candidate_count": 2,
+  "decisions": [
+    {
+      "timestamp": "2026-11-20T14:41:00+00:00",
+      "underlying": "QQQ",
+      "strategy": "trend_continuation",
+      "direction": "put",
+      "trend": "strong bearish",
+      "volatility": "normal",
+      "technical_score": 74.69,
+      "raw_technical_points": 59.75,
+      "threshold_met": false,
+      "rejection_reason": "SIGNAL_SCORE_TOO_LOW",
+      "final_decision": "TECHNICAL_REJECTED"
+    },
+    {
+      "timestamp": "2026-11-20T15:17:00+00:00",
+      "underlying": "SPY",
+      "strategy": "vwap_reversal",
+      "direction": "put",
+      "trend": "strong bearish",
+      "volatility": "normal",
+      "technical_score": 79.21,
+      "raw_technical_points": 63.37,
+      "threshold_met": false,
+      "rejection_reason": "SIGNAL_SCORE_TOO_LOW",
+      "final_decision": "TECHNICAL_REJECTED"
+    }
+  ],
+  "decision_history_limit": 500,
+  "assumptions": {
+    "fills": "No options quotes, orders, P&L, or fills are simulated by underlying-only replay",
+    "scoring": "Technical points are normalized to 0\u2013100; final option-aware qualification remains unevaluated",
+    "chronology": "Only regular-session candles closed at or before each replay timestamp are visible"
+  }
+}

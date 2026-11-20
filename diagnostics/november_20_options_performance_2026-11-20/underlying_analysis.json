@@ -1,0 +1,12 @@
+{
+  "session": "2026-11-20",
+  "underlying_bars": 780,
+  "bars_per_symbol": 390,
+  "objective_move_method": "Trailing 15-minute change >= max(0.3%, 2*ATR/price), sustained five-minute direction; grouped same-direction detections separated by <=10 minutes; top three moves per symbol.",
+  "move_count": 6,
+  "signal_candidate_count": 3,
+  "options_simulated_trades": 0,
+  "options_simulation_status": "NOT_EVALUABLE_NO_HISTORICAL_BID_ASK_QUOTES",
+  "production_changes": "NONE",
+  "orders_submitted": 0
+}

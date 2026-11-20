@@ -104,8 +104,11 @@ class Backtester:
                 fifteen = resample_candles(one, 15, now=ts.to_pydatetime())
                 if len(five) < 55 or len(fifteen) < 55:
                     continue
-                candidates = strategy.evaluate(symbol, one, five, fifteen, settings.enabled_strategies,
-                                               settings.opening_range_minutes)
+                candidates = strategy.evaluate(
+                    symbol, one, five, fifteen, settings.enabled_strategies, settings.opening_range_minutes,
+                    experiment_breakout_3_atr=settings.experiment_breakout_3_atr_enabled,
+                    experiment_confirmed_continuation=settings.experiment_confirmed_continuation_enabled,
+                )
                 for candidate in candidates:
                     eligible = quotes.loc[
                         (quotes["underlying"] == symbol) & (quotes["option_type"] == candidate.direction) &
@@ -223,6 +226,8 @@ class Backtester:
                 evaluations = strategy.evaluate_detailed(
                     symbol, one, five, fifteen, settings.enabled_strategies,
                     settings.opening_range_minutes,
+                    experiment_breakout_3_atr=settings.experiment_breakout_3_atr_enabled,
+                    experiment_confirmed_continuation=settings.experiment_confirmed_continuation_enabled,
                 )
                 summary = summaries[symbol]
                 summary["scans"] += 1

@@ -1,0 +1,25 @@
+timestamp,underlying,strategy,direction,trend,volatility,technical_score,raw_technical_points,threshold_met,rejection_reason,final_decision
+2026-11-12T15:22:00+00:00,QQQ,vwap_reversal,call,sideways,normal,70.58,56.46,False,SIGNAL_SCORE_TOO_LOW,TECHNICAL_REJECTED
+2026-11-12T18:49:00+00:00,SPY,vwap_reversal,put,moderate bullish,normal,54.99,43.99,False,STRONGER_CONFIRMATION_REQUIRED,TECHNICAL_REJECTED
+2026-11-13T17:10:00+00:00,SPY,vwap_reversal,call,strong bearish,normal,72.24,57.79,False,SIGNAL_SCORE_TOO_LOW,TECHNICAL_REJECTED
+2026-11-13T17:36:00+00:00,SPY,vwap_reversal,call,sideways,normal,77.75,62.2,False,SIGNAL_SCORE_TOO_LOW,TECHNICAL_REJECTED
+2026-11-16T16:13:00+00:00,QQQ,momentum_breakout,put,sideways,normal,60.44,48.35,False,SIGNAL_SCORE_TOO_LOW,TECHNICAL_REJECTED
+2026-11-16T16:24:00+00:00,SPY,vwap_reversal,call,strong bearish,normal,55.51,44.41,False,SIGNAL_SCORE_TOO_LOW,TECHNICAL_REJECTED
+2026-11-17T14:59:00+00:00,QQQ,vwap_reversal,call,moderate bearish,normal,57.96,46.37,False,SIGNAL_SCORE_TOO_LOW,TECHNICAL_REJECTED
+2026-11-17T15:16:00+00:00,QQQ,trend_continuation,put,moderate bearish,normal,87.46,69.97,True,,TECHNICAL_THRESHOLD_MET
+2026-11-17T15:17:00+00:00,SPY,trend_continuation,put,moderate bearish,normal,80.62,64.5,True,,TECHNICAL_THRESHOLD_MET
+2026-11-17T17:35:00+00:00,SPY,vwap_reversal,put,sideways,normal,79.38,63.5,False,SIGNAL_SCORE_TOO_LOW,TECHNICAL_REJECTED
+2026-11-17T17:39:00+00:00,SPY,vwap_reversal,put,sideways,normal,70.74,56.59,False,STRONGER_CONFIRMATION_REQUIRED,TECHNICAL_REJECTED
+2026-11-17T18:25:00+00:00,QQQ,vwap_reversal,call,moderate bearish,normal,71.01,56.81,False,SIGNAL_SCORE_TOO_LOW,TECHNICAL_REJECTED
+2026-11-17T18:55:00+00:00,QQQ,trend_continuation,put,moderate bearish,normal,82.82,66.26,True,,TECHNICAL_THRESHOLD_MET
+2026-11-17T19:40:00+00:00,QQQ,trend_continuation,put,moderate bearish,normal,78.34,62.67,False,SIGNAL_SCORE_TOO_LOW,TECHNICAL_REJECTED
+2026-11-17T20:47:00+00:00,QQQ,vwap_reversal,put,moderate bearish,normal,64.44,51.55,False,SIGNAL_SCORE_TOO_LOW,TECHNICAL_REJECTED
+2026-11-18T15:24:00+00:00,SPY,vwap_reversal,put,sideways,normal,61.18,48.94,False,SIGNAL_SCORE_TOO_LOW,TECHNICAL_REJECTED
+2026-11-18T16:08:00+00:00,SPY,momentum_breakout,put,moderate bearish,normal,77.29,61.83,False,SIGNAL_SCORE_TOO_LOW,TECHNICAL_REJECTED
+2026-11-18T17:08:00+00:00,QQQ,vwap_reversal,call,moderate bearish,normal,50.29,40.23,False,SIGNAL_SCORE_TOO_LOW,TECHNICAL_REJECTED
+2026-11-18T17:22:00+00:00,QQQ,trend_continuation,call,moderate bearish,normal,82.99,66.39,True,,TECHNICAL_THRESHOLD_MET
+2026-11-18T19:07:00+00:00,SPY,vwap_reversal,put,sideways,normal,57.49,45.99,False,STRONGER_CONFIRMATION_REQUIRED,TECHNICAL_REJECTED
+2026-11-18T20:21:00+00:00,SPY,momentum_breakout,put,moderate bearish,normal,89.22,71.38,True,,TECHNICAL_THRESHOLD_MET
+2026-11-20T14:41:00+00:00,QQQ,trend_continuation,put,strong bearish,normal,74.69,59.75,False,SIGNAL_SCORE_TOO_LOW,TECHNICAL_REJECTED
+2026-11-20T15:17:00+00:00,SPY,vwap_reversal,put,strong bearish,normal,79.21,63.37,False,SIGNAL_SCORE_TOO_LOW,TECHNICAL_REJECTED
+2026-11-20T15:20:00+00:00,SPY,momentum_breakout,put,strong bearish,normal,94.48,75.58,True,,TECHNICAL_THRESHOLD_MET

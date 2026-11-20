@@ -120,7 +120,7 @@ def test_underlying_replay_is_chronological_and_reports_technical_decisions(monk
     original = StrategyEngine.evaluate_detailed
     calls = []
 
-    def checked(self, symbol, one, five, fifteen, enabled, opening_minutes=15, news_unstable=False):
+    def checked(self, symbol, one, five, fifteen, enabled, opening_minutes=15, news_unstable=False, **experiments):
         ts = pd.Timestamp(timeline[len(calls)])
         calls.append(ts)
         if not one.empty:
