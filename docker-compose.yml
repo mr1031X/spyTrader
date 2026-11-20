@@ -1,0 +1,14 @@
+services:
+  apex:
+    build: .
+    env_file: .env
+    ports:
+      # Keep operator controls on the local host unless a private authenticated proxy is configured.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - apex-data:/app/data
+    restart: unless-stopped
+    init: true
+
+volumes:
+  apex-data:
