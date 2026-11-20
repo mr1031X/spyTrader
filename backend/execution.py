@@ -25,7 +25,7 @@ from .trailing_stop import initial_stop, option_limit_price, protection_snapshot
 
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
-ACTIVE_ORDER_STATES = {"new", "accepted", "pending_new", "partially_filled", "held", "submitting", "unknown"}
+ACTIVE_ORDER_STATES = {"new", "accepted", "pending_new", "partially_filled", "held", "submitting", "unknown", "pending_cancel"}
 
 
 class ExecutionEngine:
@@ -80,7 +80,7 @@ class ExecutionEngine:
                       symbol=order.symbol, qty=order.qty, limit_price=limit)
             return order
 
-    def sync_orders(self) -> None:
+    def sync_orders(self, settings: BotSettings | None = None) -> None:
         with self.session_factory() as session:
             orders = session.scalars(select(OrderRecord).where(
                 OrderRecord.mode == self.broker.mode, OrderRecord.status.in_(ACTIVE_ORDER_STATES)
@@ -93,9 +93,33 @@ class ExecutionEngine:
                     continue
                 with self.session_factory() as session:
                     order = session.get(OrderRecord, order_id)
-                    if order:
-                        self._apply_order_state(session, order, state)
+                    if not order:
+                        continue
+                    self._apply_order_state(session, order, state)
+                    session.commit()
+                    created = order.created_at
+                    intent = order.position_intent
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                timed_out = (
+                    settings is not None and intent == "buy_to_open" and state.status in ACTIVE_ORDER_STATES
+                    and utcnow() - created >= timedelta(seconds=settings.entry_order_timeout_seconds)
+                )
+                if timed_out and broker_id:
+                    self.broker.cancel_order(broker_id)
+                    confirmed = self.broker.get_order(broker_id)
+                    with self.session_factory() as session:
+                        order = session.get(OrderRecord, order_id)
+                        self._apply_order_state(session, order, confirmed)
                         session.commit()
+                        if confirmed.status in ACTIVE_ORDER_STATES:
+                            log_event(session, "warning", "entry_cancel_pending",
+                                      "Opening order timed out; cancellation is not yet confirmed",
+                                      client_order_id=client_id)
+                        else:
+                            log_event(session, "info", "entry_timeout_canceled",
+                                      "Stale opening order canceled; a new signal must pass revalidation",
+                                      client_order_id=client_id)
             except BrokerError as exc:
                 logger.error("Order sync failed for %s: %s", client_id, exc)
 
@@ -164,6 +188,10 @@ class ExecutionEngine:
             position.initial_qty = state.filled_qty
             position.entry_premium = state.filled_avg_price
             position.highest_bid = max(position.highest_bid, state.filled_avg_price)
+            stop_percent = float((position.protection or {}).get("initial_stop_loss_percent", 10))
+            position.stop_threshold = max(
+                position.stop_threshold, initial_stop(state.filled_avg_price, stop_percent),
+            )
         position.updated_at = utcnow()
 
     def _apply_exit_fill(self, session, order: OrderRecord, state: OrderState, previous_filled: int) -> None:
@@ -236,7 +264,7 @@ class ExecutionEngine:
 
     def request_exit(self, position_id: str, reason: str, quote: Quote, settings: BotSettings) -> OrderRecord | None:
         error = quote.validation_error(max_age_seconds=settings.max_quote_age_seconds,
-                                       max_spread_percent=settings.max_spread_percent)
+                                       max_spread_percent=None)
         if error:
             raise ValueError(error)
         with self.session_factory() as session:
@@ -276,6 +304,53 @@ class ExecutionEngine:
             session.commit()
             return order
 
+    def manage_exit(self, position_id: str, quote: Quote, settings: BotSettings) -> OrderRecord | None:
+        error = quote.validation_error(max_age_seconds=settings.max_quote_age_seconds, max_spread_percent=None)
+        if error:
+            raise ValueError(error)
+        with self.session_factory() as session:
+            position = session.get(PositionRecord, position_id)
+            order = session.get(OrderRecord, position.exit_order_id) if position and position.exit_order_id else None
+            if not position or not order or order.status not in ACTIVE_ORDER_STATES:
+                return order
+            created = order.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if utcnow() - created < timedelta(seconds=settings.exit_order_reprice_seconds):
+                return order
+            broker_id = order.broker_order_id
+        if not broker_id:
+            return order
+        state = self.broker.get_order(broker_id)
+        with self.session_factory() as session:
+            order = session.get(OrderRecord, order.id)
+            self._apply_order_state(session, order, state)
+            session.commit()
+        if state.status in ACTIVE_ORDER_STATES:
+            self.broker.cancel_order(broker_id)
+            state = self.broker.get_order(broker_id)
+            with self.session_factory() as session:
+                order = session.get(OrderRecord, order.id)
+                self._apply_order_state(session, order, state)
+                session.commit()
+            if state.status in ACTIVE_ORDER_STATES:
+                logger.warning("Protective exit %s is awaiting confirmed cancellation", order.client_order_id)
+                return order
+        with self.session_factory() as session:
+            position = session.get(PositionRecord, position_id)
+            remaining = position.qty if position else 0
+            reason = order.reason or "protective_exit"
+        if remaining > 0:
+            replacement = self.request_exit(position_id, reason, quote, settings)
+            if replacement:
+                with self.session_factory() as session:
+                    log_event(session, "warning", "exit_repriced",
+                              "Protective exit replaced after confirmed cancellation",
+                              position_id=position_id, previous_broker_order_id=broker_id,
+                              replacement_client_order_id=replacement.client_order_id)
+            return replacement
+        return order
+
     def cancel_opening_orders(self) -> None:
         with self.session_factory() as session:
             orders = session.scalars(select(OrderRecord).where(
@@ -292,23 +367,47 @@ class ExecutionEngine:
 
     def emergency_liquidate(self) -> dict[str, Any]:
         self.cancel_opening_orders()
+        self.sync_orders()
+        failures: list[str] = []
+        blocked_symbols: set[str] = set()
         with self.session_factory() as session:
             positions = session.scalars(select(PositionRecord).where(
                 PositionRecord.mode == self.broker.mode, PositionRecord.status.in_(["open", "closing"])
             )).all()
-            # Cancel existing exits before broker liquidation to avoid over-closing.
-            exit_ids = [p.exit_order_id for p in positions if p.exit_order_id]
-        for exit_id in exit_ids:
-            with self.session_factory() as session:
-                exit_order = session.get(OrderRecord, exit_id)
-                broker_id = exit_order.broker_order_id if exit_order else None
-            if broker_id:
-                try:
-                    self.broker.cancel_order(broker_id)
-                except BrokerError:
-                    pass
-        # A cancellation can race with a fill. Refresh quantities before deciding
-        # what remains, rather than submitting against the pre-cancellation snapshot.
+            exit_data = []
+            for position in positions:
+                if not position.exit_order_id:
+                    continue
+                exit_order = session.get(OrderRecord, position.exit_order_id)
+                if exit_order and exit_order.status in ACTIVE_ORDER_STATES:
+                    exit_data.append((exit_order.id, position.contract_symbol, exit_order.broker_order_id,
+                                      exit_order.client_order_id))
+        for order_id, symbol, broker_id, client_id in exit_data:
+            try:
+                if not broker_id:
+                    state = self.broker.find_by_client_id(client_id)
+                    if state:
+                        broker_id = state.broker_order_id
+                        with self.session_factory() as session:
+                            order = session.get(OrderRecord, order_id)
+                            self._apply_order_state(session, order, state)
+                            session.commit()
+                if not broker_id:
+                    blocked_symbols.add(symbol)
+                    failures.append(f"{symbol}: existing exit submission remains unresolved")
+                    continue
+                self.broker.cancel_order(broker_id)
+                confirmed = self.broker.get_order(broker_id)
+                with self.session_factory() as session:
+                    order = session.get(OrderRecord, order_id)
+                    self._apply_order_state(session, order, confirmed)
+                    session.commit()
+                if confirmed.status in ACTIVE_ORDER_STATES:
+                    blocked_symbols.add(symbol)
+                    failures.append(f"{symbol}: existing exit cancellation is not confirmed")
+            except Exception as exc:
+                blocked_symbols.add(symbol)
+                failures.append(f"{symbol}: could not confirm existing exit cancellation: {exc}")
         self.sync_orders()
         with self.session_factory() as session:
             positions = session.scalars(select(PositionRecord).where(
@@ -316,9 +415,8 @@ class ExecutionEngine:
             )).all()
             position_data = [(p.id, p.contract_symbol, p.qty) for p in positions]
         submitted = []
-        failures = []
         for position_id, symbol, qty in position_data:
-            if qty <= 0:
+            if qty <= 0 or symbol in blocked_symbols:
                 continue
             try:
                 state = self.broker.emergency_close(symbol, qty)

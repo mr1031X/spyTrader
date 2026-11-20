@@ -18,17 +18,20 @@ from zoneinfo import ZoneInfo
 from .broker import AlpacaBroker, BrokerConfigurationError, BrokerError
 from .config import BotSettings, DATA_DIR, Environment, get_env
 from .database import (
-    AccountSnapshot, DailyState, EventLog, OrderRecord, PositionRecord, SessionLocal, SettingsRecord,
-    TradeRecord, WeeklyState, get_settings, log_event, save_settings, utcnow,
+    AccountSnapshot, DailyState, EventLog, OpportunityDiagnosticRecord, OrderRecord, PositionRecord, SessionLocal,
+    SettingsRecord, SignalRecord, TradeRecord, WeeklyState, get_settings, log_event, save_settings, utcnow,
 )
+from .diagnostics import record_scan
 from .execution import ACTIVE_ORDER_STATES, ExecutionEngine
-from .indicators import closed_candles, resample_candles
+from .history import HistoricalBarCache
+from .indicators import closed_candles, compute_indicators, resample_candles
 from .market_data import AlpacaStreamManager, DataEntitlementError, MarketDataError, MarketDataService
 from .ml_filter import MLSignalFilter, feature_vector
 from .news import NewsService
 from .notifications import Notifier
 from .option_selector import OptionSelector
 from .risk_manager import RiskManager, week_start
+from .readiness import ReadinessState
 from .signal_engine import SignalEngine
 from .strategies import StrategyEngine
 from .trailing_stop import apply_decision, evaluate_trailing
@@ -65,7 +68,9 @@ class TradingBot:
         self._last_scan = 0.0
         self._last_reconcile = 0.0
         self._reconciled = False
-        self._data_ready = False
+        self._readiness = ReadinessState()
+        self._history: HistoricalBarCache | None = None
+        self._candidate_events: dict[tuple[str, str, str, str], float] = {}
         self._last_snapshot = 0.0
         self._last_event_at: dict[str, float] = {}
         self._eod_liquidation_date: date | None = None
@@ -113,11 +118,13 @@ class TradingBot:
                 self._last_error = None
             except (BrokerConfigurationError, DataEntitlementError) as exc:
                 self._set_state("setup_required", str(exc))
-                self._data_ready = False
+                self._readiness.broker_connected = False
+                self._readiness.order_execution = False
             except Exception as exc:
                 logger.exception("Trading engine tick failed")
                 self._set_state("error", str(exc))
-                self._data_ready = False
+                self._readiness.order_execution = False
+                self._readiness.errors["runtime"] = str(exc)
                 self._throttled_event("runtime_error", "critical", "runtime_error", str(exc), interval=30)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=1.0)
@@ -141,11 +148,13 @@ class TradingBot:
         self._broker = AlpacaBroker(self._mode, self.env)
         self._market = MarketDataService(settings, self.env)
         self._execution = ExecutionEngine(self._broker, self.notifier, self.session_factory)
+        self._history = HistoricalBarCache(self._market, self._broker.get_market_calendar)
+        self._readiness = ReadinessState()
         self._reconciled = False
         self._last_reconcile = 0
         self._entries_enabled = False if settings.trading_mode == "live" and not settings.live_trading_enabled else self._entries_enabled
         self._streams = AlpacaStreamManager(self._mode, self.env)
-        self._streams.start(settings.symbols)
+        self._streams.start(settings.symbols, options_enabled=settings.options_provider == "alpaca")
 
     def _tick(self) -> None:
         with self.session_factory() as session:
@@ -156,6 +165,8 @@ class TradingBot:
         assert self._broker and self._market and self._execution
         account = self._broker.get_account()
         clock = self._broker.get_clock()
+        self._readiness.broker_connected = True
+        self._readiness.errors.pop("runtime", None)
         now = datetime.now(timezone.utc)
         self._last_account = asdict(account)
         self._clock = clock
@@ -164,7 +175,10 @@ class TradingBot:
             self._execution.reconcile(settings)
             self._reconciled = True
             self._last_reconcile = time.monotonic()
-        self._execution.sync_orders()
+        self._readiness.order_execution = bool(
+            self._reconciled and not account.blocked and not account.trade_blocked and account.options_level >= 1
+        )
+        self._execution.sync_orders(settings)
         self._manage_positions(settings)
         self._check_circuits(settings, account.equity, now)
         self._handle_eod(settings, clock, now)
@@ -221,8 +235,10 @@ class TradingBot:
                     exit_pending = bool(exit_order and exit_order.status in ACTIVE_ORDER_STATES)
             try:
                 snapshot = self._market.option_snapshot(contract)
-                self._market.validate_quote(snapshot.quote)
-                self._data_ready = True
+                self._market.validate_quote(snapshot.quote, protective=True)
+                self._readiness.options_entitlement = True
+                self._readiness.option_quotes = True
+                self._readiness.last_option_quote = snapshot.quote.timestamp
                 with self.session_factory() as session:
                     position = session.get(PositionRecord, position_id)
                     position.current_bid = snapshot.quote.bid
@@ -236,10 +252,12 @@ class TradingBot:
                 if activated:
                     self.notifier.send("Apex: trailing activated", f"{contract.symbol}; stop ${decision.stop_threshold:.2f}",
                                        enabled=settings.notifications_enabled)
-                if decision.should_exit and not exit_pending:
+                if exit_pending:
+                    self._execution.manage_exit(position_id, snapshot.quote, settings)
+                elif decision.should_exit:
                     self._execution.request_exit(position_id, reason, snapshot.quote, settings)
             except (MarketDataError, BrokerError, ValueError) as exc:
-                self._data_ready = False
+                self._readiness.option_quotes = False
                 self._throttled_event(f"quote_{position_id}", "warning", "position_data_blocked",
                                       f"Position protection is waiting for valid real-time data: {exc}", interval=15,
                                       position_id=position_id)
@@ -322,49 +340,171 @@ class TradingBot:
         close_raw = (self._clock or {}).get("next_close")
         session_close = datetime.fromisoformat(str(close_raw).replace("Z", "+00:00")) if close_raw else None
         if not self.risk.entry_time_allowed(settings, now, session_close):
+            for symbol in settings.symbols:
+                self._record_opportunity(settings, symbol, now, {
+                    "scan_status": "RISK_BLOCKED", "final_decision": "ENTRY_CUTOFF",
+                    "rejection_reasons": ["ENTRY_CUTOFF"],
+                })
             return
-        with self.session_factory() as session:
-            daily = self._daily(session, settings.trading_mode, now)
-            weekly = session.scalar(select(WeeklyState).where(WeeklyState.week_start == week_start(now.astimezone(ET).date()),
-                                                              WeeklyState.mode == settings.trading_mode))
-            open_positions = session.scalar(select(func.count(PositionRecord.id)).where(
-                PositionRecord.mode == settings.trading_mode, PositionRecord.status.in_(["open", "closing"]))) or 0
-            pending_entries = session.scalar(select(func.count(OrderRecord.id)).where(
-                OrderRecord.mode == settings.trading_mode, OrderRecord.position_intent == "buy_to_open",
-                OrderRecord.status.in_(ACTIVE_ORDER_STATES))) or 0
-            decision = self.risk.check_entry(settings, account, daily, weekly, open_positions, pending_entries,
-                                             self._entries_enabled, self._reconciled, True, self._data_ready,
-                                             now)
-        if not decision.allowed:
+        capacity = self._entry_risk(settings, account, now, execution=False)
+        if not capacity.allowed:
+            codes = self._risk_rejection_codes(capacity.reasons)
+            for symbol in settings.symbols:
+                self._record_opportunity(settings, symbol, now, {
+                    "scan_status": "RISK_BLOCKED", "final_decision": "RISK_REJECTED",
+                    "risk": {"eligible": False, "reasons": capacity.reasons},
+                    "rejection_reasons": codes,
+                })
             return
         news = self.news.assess(settings.news_filter_enabled)
         for symbol in settings.symbols:
+            payload: dict[str, Any] = {
+                "timestamp": now.isoformat(), "symbol": symbol, "scan_status": "EVALUATING",
+                "candidates": [], "rejection_reasons": [], "threshold_comparison": {},
+                "potential_threshold_comparison": {}, "contract_selections": [],
+                "qualified_signals": 0, "signals_rejected": 0,
+            }
             try:
-                bars = self._market.stock_bars(symbol, TimeFrame.Minute, 4320)
+                if self._history:
+                    bars = self._history.get(symbol, now)
+                else:
+                    bars = self._market.stock_bars(symbol, TimeFrame.Minute, start=now - timedelta(days=14), end=now)
                 one = closed_candles(bars, 1, now)
-                five = resample_candles(one, 5)
-                fifteen = resample_candles(one, 15)
-                if len(five) < 55 or len(fifteen) < 55:
-                    continue
-                candidates = self.strategy.evaluate(symbol, one, five, fifteen, settings.enabled_strategies,
-                                                    settings.opening_range_minutes, news.unstable)
-                self._last_market_cache[symbol] = {"bars": one.tail(180).to_dict("records"), "last_updated": now.isoformat()}
-                self._data_ready = True
+                five = resample_candles(one, 5, now)
+                fifteen = resample_candles(one, 15, now)
+                last_close = None
+                age_seconds = None
+                if not one.empty:
+                    last_close = one["timestamp"].iloc[-1].to_pydatetime() + timedelta(minutes=1)
+                    age_seconds = (now - last_close).total_seconds()
+                underlying_ready = bool(not one.empty and age_seconds is not None and -5 <= age_seconds <= 180)
+                historical_ready = len(one) >= 60 and len(five) >= 55 and len(fifteen) >= 55
+                self._readiness.underlying[symbol] = underlying_ready
+                self._readiness.historical[symbol] = historical_ready
+                if last_close:
+                    self._readiness.last_underlying_bar[symbol] = last_close
+                    self._readiness.last_completed_candle[symbol] = last_close
+                payload.update({
+                    "price": float(one["close"].iloc[-1]) if not one.empty else None,
+                    "market_data_fresh": underlying_ready, "market_data_age_seconds": age_seconds,
+                    "historical_bars": {"one_minute": len(one), "five_minute": len(five), "fifteen_minute": len(fifteen)},
+                    "indicator_warmup": historical_ready, "last_completed_candle": last_close,
+                })
+                if len(one) >= 60:
+                    indicators = compute_indicators(one, settings.opening_range_minutes)
+                    payload["indicators"] = indicators.to_dict()
+                if not underlying_ready:
+                    payload["rejection_reasons"].append("STALE_UNDERLYING_QUOTE")
+                if not historical_ready:
+                    payload["rejection_reasons"].append("INSUFFICIENT_HISTORICAL_DATA")
+                evaluations = self.strategy.evaluate_detailed(
+                    symbol, one, five, fifteen, settings.enabled_strategies,
+                    settings.opening_range_minutes, news.unstable,
+                ) if underlying_ready else []
+                payload["strategies"] = [item.to_dict() for item in evaluations]
+                payload["trend"] = evaluations[0].trend if evaluations else "unknown"
+                payload["volatility_regime"] = evaluations[0].volatility if evaluations else "unknown"
+                for item in evaluations:
+                    if item.candidate is None:
+                        payload["rejection_reasons"].extend(item.rejected)
+                self._last_market_cache[symbol] = {
+                    "bars": one.tail(180).to_dict("records"), "last_updated": now.isoformat(),
+                }
             except Exception as exc:
-                self._data_ready = False
+                self._readiness.underlying[symbol] = False
+                self._readiness.historical[symbol] = False
+                self._readiness.errors[f"bars_{symbol}"] = str(exc)
+                payload.update({"scan_status": "DATA_ERROR", "final_decision": "DATA_NOT_READY"})
+                payload["rejection_reasons"].append("DATA_NOT_READY")
+                self._record_opportunity(settings, symbol, now, payload)
                 self._throttled_event(f"bars_{symbol}", "warning", "market_data_error", str(exc), interval=30)
                 continue
+
+            candidates = [item.candidate for item in evaluations if item.candidate is not None]
+            payload["signals_rejected"] = len(evaluations) - len(candidates)
+            if not candidates:
+                payload["scan_status"] = "SCANNED"
+                payload["final_decision"] = "DATA_NOT_READY" if not underlying_ready else (
+                    "WARMING_UP" if not historical_ready else "NO_VALID_SETUP"
+                )
+                self._record_opportunity(settings, symbol, now, payload)
+                continue
+
             selector = OptionSelector(self._broker, self._market)
             for candidate in candidates:
+                event_key = candidate.event_key or f"{candidate.strategy}:{candidate.reference_price}"
+                identity = (symbol, candidate.strategy, candidate.direction, event_key)
+                summary = {"direction": candidate.direction, "strategy": candidate.strategy,
+                           "trend": candidate.trend, "volatility": candidate.volatility}
+                payload["candidates"].append(summary)
+                if identity in self._candidate_events:
+                    payload["rejection_reasons"].append("DUPLICATE_SETUP")
+                    summary["rejection"] = "DUPLICATE_SETUP"
+                    continue
+                self._candidate_events[identity] = now.timestamp()
+                preliminary = self.scorer.score_underlying(candidate, settings)
+                summary["underlying_score"] = preliminary.score
+                explanation: dict[str, Any] = {
+                    "reasons": candidate.explanation, "contributions": preliminary.contributions,
+                    "technical_score": preliminary.technical_score, "event_key": event_key,
+                }
+                with self.session_factory() as session:
+                    record = SignalRecord(
+                        mode=settings.trading_mode, underlying=symbol, strategy=candidate.strategy,
+                        direction=candidate.direction, score=preliminary.score, qualified=False,
+                        regime=candidate.regime, factors=preliminary.factor_scores,
+                        explanation=explanation, rejection_reason="OPTION_EVALUATION_PENDING",
+                    )
+                    session.add(record)
+                    session.commit()
+                    signal_id = record.id
+                maximum_score = preliminary.score + settings.score_weights.liquidity + settings.score_weights.reward_risk
+                for threshold in (70, 80, 90):
+                    key = str(threshold)
+                    comparison = payload["potential_threshold_comparison"]
+                    comparison[key] = comparison.get(key, 0) + int(maximum_score >= threshold)
+                if maximum_score < settings.min_signal_score:
+                    summary["rejection"] = "SIGNAL_SCORE_TOO_LOW"
+                    payload["rejection_reasons"].append("SIGNAL_SCORE_TOO_LOW")
+                    self._reject_signal(signal_id, "SIGNAL_SCORE_TOO_LOW", explanation)
+                    continue
                 try:
-                    selected = selector.select(candidate, settings, account.equity)
+                    selection = selector.select_detailed(candidate, settings, account.equity)
+                    contract_details = selection.to_dict()
+                    selection_payload = {**selection.stats, "details": contract_details}
+                    payload["contract_selection"] = selection_payload
+                    payload["contract_selections"].append(selection_payload)
+                    payload["rejection_reasons"].extend(selection.rejection_codes)
+                    summary["contract_selection"] = contract_details
                 except (MarketDataError, BrokerError, ValueError) as exc:
-                    self._data_ready = False
+                    self._readiness.option_quotes = False
+                    summary["rejection"] = "OPTIONS_DATA_NOT_READY"
+                    payload["rejection_reasons"].append("OPTIONS_DATA_NOT_READY")
+                    self._reject_signal(signal_id, "OPTIONS_DATA_NOT_READY", explanation, str(exc))
                     self._throttled_event(f"select_{symbol}", "warning", "contract_selection_blocked", str(exc), interval=30)
                     continue
-                if not selected:
+                selected = selection.selected
+                if selected is None:
+                    summary["rejection"] = "NO_ELIGIBLE_OPTION"
+                    payload["rejection_reasons"].append("NO_ELIGIBLE_OPTION")
+                    self._reject_signal(signal_id, "NO_ELIGIBLE_OPTION", explanation)
                     continue
+                self._readiness.options_entitlement = True
+                self._readiness.option_quotes = True
+                self._readiness.last_option_quote = selected.snapshot.quote.timestamp
                 scored = self.scorer.score(candidate, settings, selected.liquidity_score, selected.reward_risk_score)
+                summary["score"] = scored.score
+                summary["technical_score"] = scored.technical_score
+                summary["option_quality_score"] = scored.option_quality_score
+                for threshold in (70, 80, 90):
+                    key = str(threshold)
+                    comparison = payload["threshold_comparison"]
+                    comparison[key] = comparison.get(key, 0) + int(scored.score >= threshold)
+                explanation.update({
+                    "reasons": scored.explanation, "contributions": scored.contributions,
+                    "technical_score": scored.technical_score, "option_quality_score": scored.option_quality_score,
+                    "option": selected.ranking_explanation,
+                })
                 ml_output = None
                 ml_rejection = None
                 if scored.qualified and settings.ml_filter_enabled:
@@ -375,34 +515,132 @@ class TradingBot:
                         ml_rejection = "ML filter is enabled but no out-of-sample-approved model is available"
                     elif ml_output < 0.50:
                         ml_rejection = f"Approved ML filter output {ml_output:.3f} is below 0.500"
-                explanation = {"reasons": scored.explanation, "contributions": scored.contributions,
-                               "option": selected.ranking_explanation}
                 if settings.ml_filter_enabled:
                     explanation["ml_filter"] = {"enabled": True, "approved": self.ml_filter.approved,
                                                 "output": ml_output, "threshold": 0.50}
-                with self.session_factory() as session:
-                    from .database import SignalRecord
-                    record = SignalRecord(mode=settings.trading_mode, underlying=symbol, strategy=candidate.strategy,
-                                          direction=candidate.direction, score=scored.score,
-                                          qualified=scored.qualified and ml_rejection is None,
-                                          regime=candidate.regime, factors=scored.factor_scores,
-                                          explanation=explanation,
-                                          rejection_reason=scored.rejection_reason or ml_rejection)
-                    session.add(record)
-                    session.commit()
                 if not scored.qualified or ml_rejection:
+                    code = "ML_FILTER_REJECTED" if ml_rejection else "SIGNAL_SCORE_TOO_LOW"
+                    summary["rejection"] = code
+                    payload["rejection_reasons"].append(code)
+                    self._reject_signal(signal_id, code, explanation, ml_rejection or scored.rejection_reason, scored)
                     continue
-                size = self.risk.position_size(scored.score, selected.snapshot.quote.ask,
-                                               selected.snapshot.contract.multiplier, account.equity,
-                                               account.options_buying_power, settings)
+                final_risk = self._entry_risk(settings, account, now, execution=True, symbol=symbol)
+                explanation["risk"] = {"eligible": final_risk.allowed, "reasons": final_risk.reasons}
+                payload["risk"] = explanation["risk"]
+                if not final_risk.allowed:
+                    codes = self._risk_rejection_codes(final_risk.reasons)
+                    summary["rejection"] = codes[0] if codes else "RISK_REJECTED"
+                    payload["rejection_reasons"].extend(codes)
+                    self._reject_signal(signal_id, summary["rejection"], explanation, "; ".join(final_risk.reasons), scored)
+                    continue
+                size = self.risk.position_size(
+                    scored.score, selected.snapshot.quote.ask, selected.snapshot.contract.multiplier,
+                    account.equity, account.options_buying_power, settings,
+                )
+                explanation["position_size"] = size.__dict__
                 if size.quantity < 1:
+                    summary["rejection"] = "INSUFFICIENT_BUYING_POWER"
+                    payload["rejection_reasons"].append("INSUFFICIENT_BUYING_POWER")
+                    self._reject_signal(signal_id, "INSUFFICIENT_BUYING_POWER", explanation, scored=scored)
                     continue
+                with self.session_factory() as session:
+                    record = session.get(SignalRecord, signal_id)
+                    record.score = scored.score
+                    record.qualified = True
+                    record.factors = scored.factor_scores
+                    record.explanation = explanation
+                    record.rejection_reason = None
+                    session.commit()
+                payload["qualified_signals"] += 1
+                payload["scan_status"] = "SCANNED"
+                payload["final_decision"] = "QUALIFIED"
                 try:
-                    self._execution.submit_entry(scored, selected, size, settings)
-                    return
+                    order = self._execution.submit_entry(scored, selected, size, settings)
+                    summary["order_id"] = order.id
+                    summary["client_order_id"] = order.client_order_id
+                    payload["final_decision"] = "ORDER_SUBMITTED"
+                    payload["order"] = {"id": order.id, "client_order_id": order.client_order_id,
+                                        "symbol": order.symbol, "qty": order.qty}
                 except (MarketDataError, BrokerError, ValueError) as exc:
+                    payload["final_decision"] = "ORDER_REJECTED"
+                    payload["rejection_reasons"].append("ORDER_REJECTED")
+                    summary["rejection"] = "ORDER_REJECTED"
+                    self._reject_signal(signal_id, "ORDER_REJECTED", explanation, str(exc), scored)
                     self._throttled_event(f"entry_{symbol}", "warning", "entry_submission_blocked", str(exc), interval=30)
-                    continue
+                if payload["final_decision"] == "ORDER_SUBMITTED":
+                    self._record_opportunity(settings, symbol, now, payload)
+                    return
+            payload["scan_status"] = "SCANNED"
+            if "final_decision" not in payload:
+                payload["final_decision"] = "SIGNAL_REJECTED"
+            self._record_opportunity(settings, symbol, now, payload)
+        cutoff = now.timestamp() - 6 * 3600
+        self._candidate_events = {key: value for key, value in self._candidate_events.items() if value >= cutoff}
+
+    def _entry_risk(self, settings: BotSettings, account, now: datetime, execution: bool,
+                    symbol: str | None = None):
+        with self.session_factory() as session:
+            daily = self._daily(session, settings.trading_mode, now)
+            weekly = session.scalar(select(WeeklyState).where(
+                WeeklyState.week_start == week_start(now.astimezone(ET).date()),
+                WeeklyState.mode == settings.trading_mode,
+            ))
+            open_positions = session.scalar(select(func.count(PositionRecord.id)).where(
+                PositionRecord.mode == settings.trading_mode, PositionRecord.status.in_(["open", "closing"]))) or 0
+            pending_entries = session.scalar(select(func.count(OrderRecord.id)).where(
+                OrderRecord.mode == settings.trading_mode, OrderRecord.position_intent == "buy_to_open",
+                OrderRecord.status.in_(ACTIVE_ORDER_STATES))) or 0
+        if execution:
+            ready = bool(symbol and self._readiness.execution_ready(symbol, self._reconciled))
+            return self.risk.check_entry(
+                settings, account, daily, weekly, open_positions, pending_entries,
+                self._entries_enabled, self._reconciled, True, ready, now,
+            )
+        return self.risk.check_entry_capacity(
+            settings, account, daily, weekly, open_positions, pending_entries,
+            self._entries_enabled, self._reconciled, True, now,
+        )
+
+    @staticmethod
+    def _risk_rejection_codes(reasons: list[str]) -> list[str]:
+        mapping = {
+            "Daily completed-trade limit reached": "DAILY_TRADE_LIMIT",
+            "Maximum open position or entry capacity reached": "EXISTING_POSITION",
+            "A loss circuit breaker is active": "DAILY_LOSS_LIMIT",
+            "Maximum consecutive losses reached": "CONSECUTIVE_LOSS_LIMIT",
+            "Real-time execution-quality data is unavailable": "DATA_NOT_READY",
+            "Broker state is not reconciled": "BROKER_NOT_RECONCILED",
+            "Account or options permission check failed": "BROKER_NOT_READY",
+            "Past the new-entry cutoff": "ENTRY_CUTOFF",
+            "Automated entries are paused": "ENTRIES_PAUSED",
+        }
+        return [mapping.get(reason, "RISK_REJECTED") for reason in reasons]
+
+    def _reject_signal(self, signal_id: str, code: str, explanation: dict[str, Any],
+                       detail: str | None = None, scored=None) -> None:
+        with self.session_factory() as session:
+            record = session.get(SignalRecord, signal_id)
+            if record is None:
+                return
+            if scored is not None:
+                record.score = scored.score
+                record.factors = scored.factor_scores
+            record.qualified = False
+            record.explanation = explanation
+            record.rejection_reason = f"{code}: {detail}" if detail else code
+            session.commit()
+
+    def _record_opportunity(self, settings: BotSettings, symbol: str, now: datetime,
+                            payload: dict[str, Any]) -> None:
+        payload["signals_rejected"] = (
+            sum(not item.get("candidate", False) for item in payload.get("strategies", []))
+            + sum(bool(item.get("rejection")) for item in payload.get("candidates", []))
+        )
+        try:
+            with self.session_factory() as session:
+                record_scan(session, settings.trading_mode, symbol, now, payload)
+        except Exception:
+            logger.exception("Could not persist opportunity diagnostics for %s", symbol)
 
     def preflight(self, mode: str, strict_fresh: bool = False) -> dict[str, Any]:
         checks = []
@@ -465,9 +703,17 @@ class TradingBot:
         ):
             raise RuntimeError("Live authorization is not active; repeat the protected live-activation workflow")
         result = self.preflight(settings.trading_mode, strict_fresh=False)
-        if not result["ready"]:
-            raise RuntimeError("Preflight failed: " + "; ".join(c["detail"] for c in result["checks"] if not c["passed"]))
-        self._data_ready = True
+        blocking = [check for check in result["checks"] if not check["passed"] and check["name"] != "options_data"]
+        if blocking:
+            raise RuntimeError("Preflight failed: " + "; ".join(check["detail"] for check in blocking))
+        option_warnings = [check["detail"] for check in result["checks"]
+                           if not check["passed"] and check["name"] == "options_data"]
+        if option_warnings:
+            with self.session_factory() as session:
+                log_event(session, "warning", "options_data_waiting",
+                          "Underlying scanning enabled; order execution remains blocked until options data passes",
+                          details=option_warnings)
+        self._readiness.option_quotes = False
         self._entries_enabled = True
         self._set_state("running")
 
@@ -528,13 +774,16 @@ class TradingBot:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
+            market_settings = getattr(self._market, "settings", None)
+            symbols = market_settings.symbols if market_settings else ["SPY", "QQQ"]
+            readiness = self._readiness.to_dict(symbols, self._reconciled)
             return {
                 "state": self._state, "entries_enabled": self._entries_enabled,
                 "runtime_active": self._runtime_active, "mode": self._mode,
                 "last_error": self._last_error,
                 "account": ({k: v for k, v in self._last_account.items() if k != "raw"} if self._last_account else None),
                 "clock": self._clock,
-                "data_ready": self._data_ready, "reconciled": self._reconciled,
+                "data_ready": readiness["data_ready"], "readiness": readiness, "reconciled": self._reconciled,
                 "provider": self._market.options_provider.name if self._market else None,
                 "stream_connected": self._streams.cache.connected if self._streams else False,
                 "stream_error": self._streams.cache.last_error if self._streams else None,

@@ -99,10 +99,11 @@ def test_incomplete_candle_excluded():
 
 
 def test_indicator_snapshot_from_closed_candles():
-    now = datetime.now(timezone.utc)
     count = 80
+    start = datetime(2026, 11, 18, 14, 30, tzinfo=timezone.utc)
+    now = start + timedelta(minutes=count + 1)
     prices = np.linspace(100, 110, count)
-    frame = pd.DataFrame({"timestamp": [now - timedelta(minutes=count-i) for i in range(count)],
+    frame = pd.DataFrame({"timestamp": [start + timedelta(minutes=i) for i in range(count)],
                           "open": prices, "high": prices + 1, "low": prices - 1,
                           "close": prices + 0.2, "volume": np.linspace(1000, 3000, count)})
     result = compute_indicators(closed_candles(frame, now=now))
@@ -119,7 +120,7 @@ def test_option_selection_uses_equity_for_affordability():
     now = datetime.now(timezone.utc)
     contract = OptionContract(
         symbol="SPY261119C00600000", underlying="SPY", option_type="call", strike=600,
-        expiration=date(2026, 11, 19), open_interest=1000,
+        expiration=date.today() + timedelta(days=2), open_interest=1000,
     )
     snapshot = OptionSnapshot(
         contract=contract,

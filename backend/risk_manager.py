@@ -31,10 +31,10 @@ class RiskDecision:
 
 
 class RiskManager:
-    def check_entry(self, settings: BotSettings, account: AccountState, daily: DailyState,
-                    weekly: WeeklyState, open_positions: int, pending_entries: int,
-                    entries_requested: bool, broker_reconciled: bool, market_open: bool,
-                    data_ready: bool, now: datetime | None = None) -> RiskDecision:
+    def check_entry_capacity(self, settings: BotSettings, account: AccountState, daily: DailyState,
+                             weekly: WeeklyState, open_positions: int, pending_entries: int,
+                             entries_requested: bool, broker_reconciled: bool, market_open: bool,
+                             now: datetime | None = None) -> RiskDecision:
         reasons = []
         if not entries_requested:
             reasons.append("Automated entries are paused")
@@ -52,12 +52,23 @@ class RiskManager:
             reasons.append("Broker state is not reconciled")
         if not market_open:
             reasons.append("Market is closed")
-        if not data_ready:
-            reasons.append("Real-time execution-quality data is unavailable")
         if account.blocked or account.trade_blocked or account.options_level < 1:
             reasons.append("Account or options permission check failed")
         if now and market_open and not self.entry_time_allowed(settings, now):
             reasons.append("Past the new-entry cutoff")
+        return RiskDecision(not reasons, reasons)
+
+    def check_entry(self, settings: BotSettings, account: AccountState, daily: DailyState,
+                    weekly: WeeklyState, open_positions: int, pending_entries: int,
+                    entries_requested: bool, broker_reconciled: bool, market_open: bool,
+                    data_ready: bool, now: datetime | None = None) -> RiskDecision:
+        decision = self.check_entry_capacity(
+            settings, account, daily, weekly, open_positions, pending_entries,
+            entries_requested, broker_reconciled, market_open, now,
+        )
+        reasons = list(decision.reasons)
+        if not data_ready:
+            reasons.append("Real-time execution-quality data is unavailable")
         return RiskDecision(not reasons, reasons)
 
     def position_size(self, score: float, premium: float, multiplier: int, equity: float,

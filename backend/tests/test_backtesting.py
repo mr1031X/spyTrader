@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from backend.backtesting import Backtester
 from backend.config import BotSettings
 from backend.main import create_app
+from backend.strategies import StrategyEngine
 
 
 def synthetic_replay_inputs():
@@ -23,7 +24,13 @@ def synthetic_replay_inputs():
             if day.day < 7:
                 open_ = price
                 close = price + 0.03
-            elif index < 60:
+            elif index < 15:
+                open_ = base - 0.08 * index / 15
+                close = base - 0.08 * (index + 1) / 15
+            elif index < 59:
+                open_ = base - 0.08 + 0.08 * (index - 15) / 44
+                close = base - 0.08 + 0.08 * (index - 14) / 44
+            elif index == 59:
                 open_ = close = base
             else:
                 open_ = base if index == 60 else price
@@ -105,3 +112,47 @@ def test_backtest_api_accepts_aligned_quote_csv_without_real_market_claims():
     stored = api.get("/api/backtests").json()
     assert stored[0]["name"] == "Synthetic replay accounting test"
     assert stored[0]["results"]["net_realized_pnl"] == pytest.approx(37.40)
+
+
+def test_underlying_replay_is_chronological_and_reports_technical_decisions(monkeypatch):
+    underlying, _ = synthetic_replay_inputs()
+    timeline = sorted(underlying["timestamp"].unique())
+    original = StrategyEngine.evaluate_detailed
+    calls = []
+
+    def checked(self, symbol, one, five, fifteen, enabled, opening_minutes=15, news_unstable=False):
+        ts = pd.Timestamp(timeline[len(calls)])
+        calls.append(ts)
+        if not one.empty:
+            assert one["timestamp"].max() + pd.Timedelta(minutes=1) <= ts
+        if not five.empty:
+            assert five["timestamp"].max() + pd.Timedelta(minutes=5) <= ts
+        if not fifteen.empty:
+            assert fifteen["timestamp"].max() + pd.Timedelta(minutes=15) <= ts
+        return original(self, symbol, one, five, fifteen, enabled, opening_minutes, news_unstable)
+
+    monkeypatch.setattr(StrategyEngine, "evaluate_detailed", checked)
+    result = Backtester().run_underlying(underlying, BotSettings())
+    assert calls
+    assert result["replay_type"] == "underlying"
+    assert result["candidate_count"] > 0
+    assert result["symbols"][0]["threshold_comparison"]["70"] > 0
+    assert result["decisions"]
+    assert result["assumptions"]["fills"].startswith("No options quotes")
+    assert "trade_count" not in result
+
+
+def test_underlying_replay_api_requires_no_option_quotes():
+    underlying, _ = synthetic_replay_inputs()
+    api = TestClient(create_app())
+    response = api.post(
+        "/api/backtests/underlying",
+        files={"underlying_file": ("underlying.csv", underlying.to_csv(index=False).encode(), "text/csv")},
+        data={"parameters": json.dumps({"name": "Underlying diagnostics test"})},
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["replay_type"] == "underlying"
+    assert result["candidate_count"] > 0
+    stored = api.get("/api/backtests").json()
+    assert stored[0]["results"]["replay_type"] == "underlying"

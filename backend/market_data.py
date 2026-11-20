@@ -3,11 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any
 
 import httpx
 import pandas as pd
@@ -40,14 +39,18 @@ class Quote:
     provider: str
     bid_size: float | None = None
     ask_size: float | None = None
+    received_at: datetime | None = None
+    timestamp_source: str = "provider"
+    entitlement: str = "real-time"
 
-    def validation_error(self, now: datetime | None = None, max_age_seconds: float = 3, max_spread_percent: float = 8) -> str | None:
+    def validation_error(self, now: datetime | None = None, max_age_seconds: float | None = 3,
+                         max_spread_percent: float | None = 8) -> str | None:
         now = now or datetime.now(timezone.utc)
         timestamp = self.timestamp if self.timestamp.tzinfo else self.timestamp.replace(tzinfo=timezone.utc)
         age = (now - timestamp).total_seconds()
         if age < -5:
             return "Quote timestamp is in the future"
-        if age > max_age_seconds:
+        if max_age_seconds is not None and age > max_age_seconds:
             return f"Quote is stale ({age:.1f}s old)"
         if self.bid <= 0 or self.ask <= 0:
             return "Bid and ask must be positive"
@@ -57,7 +60,7 @@ class Quote:
         if midpoint <= 0:
             return "Invalid midpoint"
         spread_percent = (self.ask - self.bid) / midpoint * 100
-        if spread_percent > max_spread_percent:
+        if max_spread_percent is not None and spread_percent > max_spread_percent:
             return f"Spread {spread_percent:.1f}% exceeds {max_spread_percent:.1f}%"
         return None
 
@@ -69,11 +72,23 @@ class Quote:
     def spread_percent(self) -> float:
         return (self.ask - self.bid) / self.midpoint * 100 if self.midpoint else float("inf")
 
+    @property
+    def age_seconds(self) -> float:
+        timestamp = self.timestamp if self.timestamp.tzinfo else self.timestamp.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - timestamp).total_seconds()
+
     def to_dict(self, now: datetime | None = None) -> dict[str, Any]:
         timestamp = self.timestamp if self.timestamp.tzinfo else self.timestamp.replace(tzinfo=timezone.utc)
+        received = self.received_at or timestamp
+        if received.tzinfo is None:
+            received = received.replace(tzinfo=timezone.utc)
         age = ((now or datetime.now(timezone.utc)) - timestamp).total_seconds()
-        return {**asdict(self), "timestamp": timestamp.isoformat(), "age_seconds": age,
-                "spread_percent": self.spread_percent, "fresh": 0 <= age <= 3}
+        return {
+            **asdict(self), "timestamp": timestamp.isoformat(), "received_at": received.isoformat(),
+            "provider_timestamp": timestamp.isoformat(), "local_receipt_timestamp": received.isoformat(),
+            "age_seconds": age, "spread_percent": self.spread_percent, "fresh": 0 <= age <= 3,
+            "feed_source": self.provider, "entitlement_status": self.entitlement,
+        }
 
 
 @dataclass(frozen=True)
@@ -108,17 +123,17 @@ class OptionsProvider(ABC):
 class AlpacaMarketData(OptionsProvider):
     name = "alpaca_opra"
 
-    def __init__(self, mode: str = "paper", env: Environment | None = None):
+    def __init__(self, mode: str = "paper", env: Environment | None = None, options_enabled: bool = True):
         self.env = env or get_env()
         key, secret = self.env.credentials(mode)
         if not key or not secret:
             raise DataEntitlementError(f"Alpaca {mode} market-data credentials are not configured")
-        if self.env.alpaca_options_feed != "opra":
+        if options_enabled and self.env.alpaca_options_feed != "opra":
             raise DataEntitlementError("Automated execution requires ALPACA_OPTIONS_FEED=opra; indicative data is blocked")
         self.key = key
         self.secret = secret
         self.stock = StockHistoricalDataClient(api_key=key, secret_key=secret)
-        self.options = OptionHistoricalDataClient(api_key=key, secret_key=secret)
+        self.options = OptionHistoricalDataClient(api_key=key, secret_key=secret) if options_enabled else None
         self.stock_feed = DataFeed.IEX if self.env.alpaca_stock_feed == "iex" else DataFeed.SIP
         self.options_feed = OptionsFeed.OPRA
 
@@ -141,13 +156,14 @@ class AlpacaMarketData(OptionsProvider):
         if item is None:
             raise MarketDataError(f"No stock quote returned for {symbol}")
         return Quote(symbol, float(item.bid_price), float(item.ask_price), self._timestamp(item.timestamp),
-                     self.name, float(item.bid_size or 0), float(item.ask_size or 0))
+                     self.name, float(item.bid_size or 0), float(item.ask_size or 0), datetime.now(timezone.utc))
 
-    def stock_bars(self, symbol: str, timeframe: TimeFrame = TimeFrame.Minute, lookback_minutes: int = 240) -> pd.DataFrame:
-        end = datetime.now(timezone.utc)
+    def stock_bars(self, symbol: str, timeframe: TimeFrame = TimeFrame.Minute, lookback_minutes: int = 240,
+                   start: datetime | None = None, end: datetime | None = None) -> pd.DataFrame:
+        end = end or datetime.now(timezone.utc)
+        start = start or end - timedelta(minutes=lookback_minutes)
         request = StockBarsRequest(
-            symbol_or_symbols=symbol, timeframe=timeframe, start=end - timedelta(minutes=lookback_minutes),
-            end=end, feed=self.stock_feed,
+            symbol_or_symbols=symbol, timeframe=timeframe, start=start, end=end, feed=self.stock_feed,
         )
         response = self._call("stock bars", self.stock.get_stock_bars, request)
         frame = response.df
@@ -165,13 +181,16 @@ class AlpacaMarketData(OptionsProvider):
         return frame.sort_values("timestamp").reset_index(drop=True)
 
     def _snapshots(self, symbols: list[str]) -> dict[str, Any]:
+        if self.options is None:
+            raise DataEntitlementError("Alpaca options data is not enabled for this provider configuration")
         request = OptionSnapshotRequest(symbol_or_symbols=symbols, feed=self.options_feed)
         return self._call("OPRA option snapshot", self.options.get_option_snapshot, request)
 
     def _daily_volumes(self, symbols: list[str]) -> dict[str, int]:
-        """Fetch observed volume separately; current SDK snapshots omit daily bars."""
         if not symbols:
             return {}
+        if self.options is None:
+            raise DataEntitlementError("Alpaca options data is not enabled for this provider configuration")
         end = datetime.now(timezone.utc)
         request = OptionBarsRequest(
             symbol_or_symbols=symbols, timeframe=TimeFrame.Day,
@@ -197,9 +216,9 @@ class AlpacaMarketData(OptionsProvider):
             raise MarketDataError(f"No OPRA quote returned for {contract.symbol}")
         quote = Quote(contract.symbol, float(latest.bid_price), float(latest.ask_price),
                       self._timestamp(latest.timestamp), self.name,
-                      float(latest.bid_size or 0), float(latest.ask_size or 0))
+                      float(latest.bid_size or 0), float(latest.ask_size or 0), datetime.now(timezone.utc))
         greeks = item.greeks
-        daily = getattr(item, "daily_bar", None)  # Compatibility with older alpaca-py snapshots.
+        daily = getattr(item, "daily_bar", None)
         if volume is None and daily is not None and daily.volume is not None:
             volume = int(float(daily.volume))
         open_interest = contract.open_interest
@@ -211,8 +230,7 @@ class AlpacaMarketData(OptionsProvider):
             gamma=float(greeks.gamma) if greeks and greeks.gamma is not None else None,
             theta=float(greeks.theta) if greeks and greeks.theta is not None else None,
             implied_volatility=float(item.implied_volatility) if item.implied_volatility is not None else None,
-            open_interest=open_interest,
-            volume=volume,
+            open_interest=open_interest, volume=volume,
         )
 
     def option_snapshot(self, contract: OptionContract) -> OptionSnapshot:
@@ -227,7 +245,6 @@ class AlpacaMarketData(OptionsProvider):
         return self._convert_snapshot(contract, item, volume)
 
     def option_snapshots(self, contracts: list[OptionContract]) -> list[OptionSnapshot]:
-        # Batch requests reduce chain-scanning latency while retaining real OPRA quotes.
         results: list[OptionSnapshot] = []
         for start in range(0, len(contracts), 50):
             batch = contracts[start:start + 50]
@@ -248,7 +265,7 @@ class AlpacaMarketData(OptionsProvider):
 
 
 class TradierOptionsProvider(OptionsProvider):
-    """Production Tradier quotes only; delayed sandbox data is never accepted."""
+    """Production Tradier quotes with provider bid/ask timestamps only."""
     name = "tradier_production"
 
     def __init__(self, env: Environment | None = None):
@@ -273,12 +290,29 @@ class TradierOptionsProvider(OptionsProvider):
             item = item[0] if item else None
         if not item:
             raise MarketDataError(f"No Tradier quote returned for {contract.symbol}")
-        timestamp = datetime.now(timezone.utc)  # Receipt time; provider quote timestamps vary by entitlement.
+        try:
+            bid_time = _tradier_timestamp(item.get("biddate"))
+            ask_time = _tradier_timestamp(item.get("askdate"))
+        except (TypeError, ValueError) as exc:
+            raise MarketDataError(f"Tradier executable bid/ask timestamps are missing: {exc}") from exc
+        timestamp = min(bid_time, ask_time)
         quote = Quote(contract.symbol, float(item.get("bid") or 0), float(item.get("ask") or 0), timestamp,
-                      self.name, item.get("bidsize"), item.get("asksize"))
+                      self.name, item.get("bidsize"), item.get("asksize"), datetime.now(timezone.utc))
         greeks = item.get("greeks") or {}
         return OptionSnapshot(contract, quote, greeks.get("delta"), greeks.get("gamma"), greeks.get("theta"),
                               item.get("implied_volatility"), item.get("open_interest"), item.get("volume"))
+
+
+def _tradier_timestamp(value: Any) -> datetime:
+    if value in (None, "", 0, "0"):
+        raise ValueError("provider timestamp is zero or absent")
+    if isinstance(value, (int, float)) or str(value).replace(".", "", 1).isdigit():
+        numeric = float(value)
+        if numeric > 1e12:
+            numeric /= 1000
+        return datetime.fromtimestamp(numeric, timezone.utc)
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 class QuoteCache:
@@ -293,7 +327,8 @@ class QuoteCache:
             symbol = data.symbol
             quote = Quote(symbol, float(data.bid_price), float(data.ask_price),
                           data.timestamp if data.timestamp.tzinfo else data.timestamp.replace(tzinfo=timezone.utc),
-                          "alpaca_stream", float(data.bid_size or 0), float(data.ask_size or 0))
+                          "alpaca_stream", float(data.bid_size or 0), float(data.ask_size or 0),
+                          datetime.now(timezone.utc))
             with self._lock:
                 self._quotes[symbol] = quote
                 self.connected = True
@@ -307,7 +342,7 @@ class QuoteCache:
 
 
 class AlpacaStreamManager:
-    """Supervised WebSocket streams; the SDK reconnect loop is wrapped for failures."""
+    """Supervised WebSocket streams; options streaming is provider-specific."""
     def __init__(self, mode: str, env: Environment | None = None):
         self.env = env or get_env()
         self.mode = mode
@@ -317,19 +352,23 @@ class AlpacaStreamManager:
         self._stock_stream = None
         self._option_stream = None
 
-    def start(self, stock_symbols: list[str], option_symbols: list[str] | None = None) -> None:
+    def start(self, stock_symbols: list[str], option_symbols: list[str] | None = None,
+              options_enabled: bool = True) -> None:
         if self._threads:
             return
         key, secret = self.env.credentials(self.mode)
-        if not key or not secret or self.env.alpaca_options_feed != "opra":
+        if not key or not secret:
             return
         feed = DataFeed.IEX if self.env.alpaca_stock_feed == "iex" else DataFeed.SIP
         self._stock_stream = StockDataStream(key, secret, feed=feed)
         self._stock_stream.subscribe_quotes(self.cache.update, *stock_symbols)
-        self._option_stream = OptionDataStream(key, secret, feed=OptionsFeed.OPRA)
-        if option_symbols:
-            self._option_stream.subscribe_quotes(self.cache.update, *option_symbols)
-        for name, stream in (("stock", self._stock_stream), ("option", self._option_stream)):
+        streams = [("stock", self._stock_stream)]
+        if options_enabled and self.env.alpaca_options_feed == "opra":
+            self._option_stream = OptionDataStream(key, secret, feed=OptionsFeed.OPRA)
+            if option_symbols:
+                self._option_stream.subscribe_quotes(self.cache.update, *option_symbols)
+            streams.append(("option", self._option_stream))
+        for name, stream in streams:
             thread = threading.Thread(target=self._supervise, args=(name, stream), daemon=True, name=f"apex-{name}-stream")
             thread.start()
             self._threads.append(thread)
@@ -362,7 +401,9 @@ class MarketDataService:
     def __init__(self, settings: BotSettings, env: Environment | None = None):
         self.settings = settings
         self.env = env or get_env()
-        self.alpaca = AlpacaMarketData(settings.trading_mode, self.env)
+        self.alpaca = AlpacaMarketData(
+            settings.trading_mode, self.env, options_enabled=settings.options_provider == "alpaca",
+        )
         self.options_provider: OptionsProvider = (
             self.alpaca if settings.options_provider == "alpaca" else TradierOptionsProvider(self.env)
         )
@@ -370,8 +411,9 @@ class MarketDataService:
     def stock_quote(self, symbol: str) -> Quote:
         return self.alpaca.stock_quote(symbol)
 
-    def stock_bars(self, symbol: str, timeframe: TimeFrame = TimeFrame.Minute, lookback_minutes: int = 240) -> pd.DataFrame:
-        return self.alpaca.stock_bars(symbol, timeframe, lookback_minutes)
+    def stock_bars(self, symbol: str, timeframe: TimeFrame = TimeFrame.Minute, lookback_minutes: int = 240,
+                   start: datetime | None = None, end: datetime | None = None) -> pd.DataFrame:
+        return self.alpaca.stock_bars(symbol, timeframe, lookback_minutes, start, end)
 
     def option_snapshot(self, contract: OptionContract) -> OptionSnapshot:
         return self.options_provider.option_snapshot(contract)
@@ -379,8 +421,10 @@ class MarketDataService:
     def option_snapshots(self, contracts: list[OptionContract]) -> list[OptionSnapshot]:
         return self.options_provider.option_snapshots(contracts)
 
-    def validate_quote(self, quote: Quote) -> None:
-        error = quote.validation_error(max_age_seconds=self.settings.max_quote_age_seconds,
-                                       max_spread_percent=self.settings.max_spread_percent)
+    def validate_quote(self, quote: Quote, protective: bool = False) -> None:
+        error = quote.validation_error(
+            max_age_seconds=self.settings.max_quote_age_seconds,
+            max_spread_percent=None if protective else self.settings.max_spread_percent,
+        )
         if error:
             raise MarketDataError(error)

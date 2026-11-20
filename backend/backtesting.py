@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 from .config import BotSettings
-from .indicators import closed_candles, resample_candles
+from .indicators import closed_candles, filter_regular_session, resample_candles
 from .risk_manager import RiskManager
 from .strategies import StrategyEngine
 from .signal_engine import SignalEngine
@@ -97,11 +97,11 @@ class Backtester:
                 continue
             for symbol in underlying["symbol"].unique():
                 rows = underlying.loc[(underlying["symbol"] == symbol) & (underlying["timestamp"] <= ts)]
-                one = closed_candles(rows.tail(1600), now=ts.to_pydatetime())
+                one = filter_regular_session(closed_candles(rows.tail(1600), now=ts.to_pydatetime()))
                 if len(one) < 60:
                     continue
-                five = resample_candles(one, 5)
-                fifteen = resample_candles(one, 15)
+                five = resample_candles(one, 5, now=ts.to_pydatetime())
+                fifteen = resample_candles(one, 15, now=ts.to_pydatetime())
                 if len(five) < 55 or len(fifteen) < 55:
                     continue
                 candidates = strategy.evaluate(symbol, one, five, fifteen, settings.enabled_strategies,
@@ -170,4 +170,120 @@ class Backtester:
             "open_position": open_position,
             "assumptions": {"slippage_percent": slippage_percent, "fee_per_contract": fee_per_contract,
                             "fills": "Simulated against supplied observed historical bid/ask quotes; not broker fills"},
+        }
+
+    def run_underlying(self, underlying: pd.DataFrame, settings: BotSettings,
+                       evaluation_start: datetime | None = None,
+                       evaluation_end: datetime | None = None) -> dict[str, Any]:
+        if underlying.empty:
+            raise BacktestError("Historical underlying bars are required")
+        required = {"timestamp", "symbol", "open", "high", "low", "close", "volume"}
+        missing = required - set(underlying.columns)
+        if missing:
+            raise BacktestError(f"Missing underlying columns: {', '.join(sorted(missing))}")
+        data = underlying.copy()
+        try:
+            data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
+        except Exception as exc:
+            raise BacktestError(f"Invalid underlying timestamps: {exc}") from exc
+        data = data.sort_values("timestamp").reset_index(drop=True)
+        timeline = sorted(data["timestamp"].unique())
+        start = pd.Timestamp(evaluation_start) if evaluation_start is not None else None
+        end = pd.Timestamp(evaluation_end) if evaluation_end is not None else None
+        if start is not None:
+            start = start.tz_localize("UTC") if start.tzinfo is None else start.tz_convert("UTC")
+            timeline = [timestamp for timestamp in timeline if pd.Timestamp(timestamp) >= start]
+        if end is not None:
+            end = end.tz_localize("UTC") if end.tzinfo is None else end.tz_convert("UTC")
+            timeline = [timestamp for timestamp in timeline if pd.Timestamp(timestamp) <= end]
+        if start is not None and end is not None and start > end:
+            raise BacktestError("Evaluation start must not be after evaluation end")
+        rows_by_symbol = {symbol: rows.reset_index(drop=True) for symbol, rows in data.groupby("symbol")}
+        summaries = {
+            symbol: {
+                "underlying": symbol, "scans": 0, "strategy_evaluations": 0,
+                "candidates": 0, "bullish_candidates": 0, "bearish_candidates": 0,
+                "technical_threshold_met": 0, "rejected_evaluations": 0,
+                "rejected_candidates": 0, "rejection_counts": {},
+                "threshold_comparison": {"70": 0, "80": 0, "90": 0},
+                "last_candidate": None,
+            }
+            for symbol in rows_by_symbol
+        }
+        strategy = StrategyEngine()
+        scorer = SignalEngine()
+        decisions: list[dict[str, Any]] = []
+        for timestamp in timeline:
+            ts = pd.Timestamp(timestamp)
+            for symbol, rows in rows_by_symbol.items():
+                visible = rows.loc[rows["timestamp"] <= ts].tail(1600)
+                one = filter_regular_session(closed_candles(visible, now=ts.to_pydatetime()))
+                five = resample_candles(one, 5, now=ts.to_pydatetime())
+                fifteen = resample_candles(one, 15, now=ts.to_pydatetime())
+                evaluations = strategy.evaluate_detailed(
+                    symbol, one, five, fifteen, settings.enabled_strategies,
+                    settings.opening_range_minutes,
+                )
+                summary = summaries[symbol]
+                summary["scans"] += 1
+                summary["strategy_evaluations"] += len(evaluations)
+                for evaluation in evaluations:
+                    candidate = evaluation.candidate
+                    if candidate is None:
+                        summary["rejected_evaluations"] += 1
+                        for code in evaluation.rejected or ["NO_VALID_SETUP"]:
+                            counts = summary["rejection_counts"]
+                            counts[code] = counts.get(code, 0) + 1
+                        continue
+                    scored = scorer.score_technical(candidate, settings)
+                    summary["candidates"] += 1
+                    direction_key = "bullish_candidates" if candidate.direction == "call" else "bearish_candidates"
+                    summary[direction_key] += 1
+                    for threshold in (70, 80, 90):
+                        key = str(threshold)
+                        summary["threshold_comparison"][key] += int(scored.score >= threshold)
+                    rejection_code = None
+                    if scored.qualified:
+                        summary["technical_threshold_met"] += 1
+                    else:
+                        summary["rejected_candidates"] += 1
+                        rejection_code = (
+                            "STRONGER_CONFIRMATION_REQUIRED"
+                            if candidate.stronger_confirmation_required and "stronger" in (scored.rejection_reason or "")
+                            else "SIGNAL_SCORE_TOO_LOW"
+                        )
+                        counts = summary["rejection_counts"]
+                        counts[rejection_code] = counts.get(rejection_code, 0) + 1
+                    decision = {
+                        "timestamp": ts.isoformat(), "underlying": symbol,
+                        "strategy": candidate.strategy, "direction": candidate.direction,
+                        "trend": candidate.trend, "volatility": candidate.volatility,
+                        "technical_score": scored.score,
+                        "raw_technical_points": scored.technical_score,
+                        "threshold_met": scored.qualified, "rejection_reason": rejection_code,
+                        "final_decision": "TECHNICAL_THRESHOLD_MET" if scored.qualified else "TECHNICAL_REJECTED",
+                    }
+                    summary["last_candidate"] = decision
+                    decisions.append(decision)
+                    if len(decisions) > 500:
+                        decisions = decisions[-500:]
+        symbol_results = []
+        for summary in summaries.values():
+            reasons = sorted(summary["rejection_counts"].items(), key=lambda pair: pair[1], reverse=True)
+            summary["primary_rejections"] = [
+                {"reason": reason, "count": count} for reason, count in reasons[:8]
+            ]
+            symbol_results.append(summary)
+        return {
+            "replay_type": "underlying", "symbols": symbol_results,
+            "evaluation_start": start.isoformat() if start is not None else None,
+            "evaluation_end": end.isoformat() if end is not None else None,
+            "underlying_bars": len(data), "scans_completed": sum(item["scans"] for item in symbol_results),
+            "candidate_count": sum(item["candidates"] for item in symbol_results),
+            "decisions": decisions, "decision_history_limit": 500,
+            "assumptions": {
+                "fills": "No options quotes, orders, P&L, or fills are simulated by underlying-only replay",
+                "scoring": "Technical points are normalized to 0–100; final option-aware qualification remains unevaluated",
+                "chronology": "Only regular-session candles closed at or before each replay timestamp are visible",
+            },
         }

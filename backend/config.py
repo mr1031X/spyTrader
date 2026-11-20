@@ -64,6 +64,8 @@ class BotSettings(BaseModel):
     max_quote_age_seconds: float = Field(3, gt=0, le=60)
     max_spread_percent: float = Field(8, gt=0, le=100)
     max_slippage_percent: float = Field(2, ge=0, le=100)
+    entry_order_timeout_seconds: int = Field(45, ge=5, le=600)
+    exit_order_reprice_seconds: int = Field(15, ge=5, le=300)
     min_absolute_delta: float = Field(0.40, ge=0, le=1)
     max_absolute_delta: float = Field(0.70, ge=0, le=1)
     min_open_interest: int = Field(100, ge=0)

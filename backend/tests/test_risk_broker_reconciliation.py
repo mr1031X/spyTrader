@@ -87,7 +87,7 @@ def test_tick_publishes_broker_clock(monkeypatch, account, daily):
             return clock
 
     class Execution:
-        def sync_orders(self):
+        def sync_orders(self, settings=None):
             pass
 
     class Provider:

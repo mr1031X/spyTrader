@@ -183,9 +183,13 @@ Use `MLSignalFilter.train(features, outcomes)` with chronological samples. It re
 
 When the dashboard ML filter is enabled, a qualified deterministic signal also requires an approved model output ≥ 0.50. Missing/unapproved models fail closed and block the entry. AUC and model output do not establish a durable edge or guarantee future results.
 
-## Historical quote replay
+## Historical replay
 
-Open **Quote replay** and upload two CSV files. Replay uses supplied observed option bids/asks, stated slippage, fees, actual DTE/delta/liquidity fields, and deterministic strategy rules. It does not manufacture a terminal fill when no valid quote exists; any remaining exposure is reported as an open position. Results are simulated historical execution, not Alpaca paper or live results.
+Open **Quote replay** and choose **Underlying opportunities** or **Observed option quotes**. Both modes evaluate only regular-session candles that had closed by each chronological replay timestamp; future candles and incomplete higher-timeframe candles are not exposed to strategies.
+
+Underlying-only replay requires one CSV and reports strategy candidates, independent trend/volatility classifications, normalized technical scores, threshold comparisons, and aggregated rejection reasons. It does not evaluate option quality, produce final trade qualification, simulate orders, or report P&L.
+
+Observed-quote replay requires two CSV files and uses supplied option bids/asks, stated slippage, fees, actual DTE/delta/liquidity fields, and deterministic strategy rules. It does not manufacture a terminal fill when no valid quote exists; any remaining exposure is reported as an open position. Results are simulated historical execution, not Alpaca paper or live results.
 
 Underlying CSV:
 
@@ -209,28 +213,26 @@ npm run lint
 npm run build
 ```
 
-The test suite uses isolated fake broker responses **only in tests**. It covers quote validation, closed-candle handling, scoring and allocation, position sizing, loss limits, early closes, paper/live isolation, initial and trailing stops, high-water persistence, separate trigger/fill pricing, partial fills, duplicate exits, expired-exit retry, ambiguous-order reconciliation, emergency accounting, restart recovery, notification gating/failure, API validation, and ML approval persistence. Replay coverage includes calendar-DTE alignment, exact per-side fee accounting, trailing-stop exits, CSV upload validation, separation from real-trading performance, and refusal to invent a terminal fill for an open position. Deterministic replay fixtures are synthetic test data, not market observations or broker results.
+The test suite uses isolated fake broker responses **only in tests**. It covers independent readiness gates, fresh-start SPY/QQQ scanning, calendar-aware historical warm-up, regular-session VWAP/opening ranges, completed candles, continuation and breakout setups, rejection diagnostics, provider timestamp handling, contract filters, scoring and allocation, position sizing, loss limits, early closes, paper/live isolation, initial and trailing stops, high-water persistence, separate trigger/fill pricing, partial fills, duplicate exits, protective exits during wide spreads, entry timeouts, ambiguous-order reconciliation, emergency accounting, restart recovery, notification gating/failure, API validation, and ML approval persistence. Replay coverage includes chronological visibility, underlying-only diagnostics, calendar-DTE alignment, exact per-side fee accounting, trailing-stop exits, CSV upload validation, separation from real-trading performance, and refusal to invent a terminal fill. Deterministic replay fixtures are synthetic test data, not market observations or broker results.
 
 ### Verification status for this delivery
 
-- Backend suite: **47 passed**, including current Alpaca stream-handler, broker-clock publication, option affordability, and option-snapshot compatibility, contract open interest, and observed daily-bar volume coverage.
-- Frontend ESLint, TypeScript compilation, and the Vite production build passed. The final PWA build generated 25 static-asset precache entries; HTML and API responses are not precached.
-- All seven routes were checked in desktop production mode. All 28 route/viewport combinations showed no horizontal page overflow and exactly one visible start action.
-- Production service-worker activation and controlled reload passed. A clean browser session loaded the application assets and APIs successfully with no console errors or warnings.
-- `npm audit --omit=dev` reported **zero production dependency findings**. The full development audit still reported **26 findings (7 moderate, 19 high)** in build-tool dependency chains, primarily glob/minimatch/picomatch. Remediation suggested by npm requires breaking toolchain downgrades; no forced downgrade was applied.
-- The Dockerfile and Compose configuration passed static review only. Docker was unavailable in the verification environment, so no image build or Compose runtime test was performed.
+- Backend suite: **71 passed**. Frontend ESLint, TypeScript compilation, and the Vite production build passed; the PWA build generated 25 static-asset precache entries.
+- An isolated production-server HTTP check loaded the built SPA and JavaScript asset, queried status and diagnostics, and completed an underlying-only replay through the API. It used a temporary database, disabled credentials, and disabled automated entries; no orders were submitted.
+- Read-only Alpaca IEX bars were replayed for November 19 through November 20, 2026 at 18:48 UTC, with earlier bars used only for warm-up. SPY and QQQ each completed 685 scans. One bearish candidate was found for each symbol on November 20: SPY scored 79.21 and QQQ scored 74.69 on the normalized technical scale, both below the unchanged 80 threshold. November 19 produced no candidates. No historical option quotes were available in this check, so no options qualification, fills, or P&L were simulated.
+- Docker image/Compose runtime and browser-layout regression checks were not rerun for this delivery.
 
-A subsequent real Alpaca paper preflight verified authentication, options permission, actual buying power, SPY IEX data, a fresh real-time OPRA option quote, and clean local order state. No paper order was submitted during that check. Automated market-hours execution, order fills, and live-market behavior remain unvalidated; they require an appropriate market session and deliberate operator action. Profitability has not been validated or guaranteed.
+An earlier real Alpaca paper preflight verified authentication, options permission, actual buying power, SPY IEX data, a fresh real-time OPRA option quote, and clean local order state. No paper order was submitted during that check or this audit. Automated order fills and live-market behavior remain unvalidated; they require an appropriate market session and deliberate operator action. Profitability has not been validated or guaranteed.
 
 ## Main API routes
 
-- `GET /api/health`, `/api/status`, `/api/settings`, `/api/preflight`
+- `GET /api/health`, `/api/status`, `/api/diagnostics`, `/api/settings`, `/api/preflight`
 - `PUT /api/settings`
 - `POST /api/control/{start|pause|resume|stop}`, `/api/emergency`
 - `POST /api/mode/paper`, `/api/mode/live`
 - `GET /api/positions`, `/api/orders`, `/api/trades`, `/api/signals`, `/api/events`, `/api/performance`
 - `GET /api/markets/{SPY|QQQ}`
-- `POST /api/backtests`, `GET /api/backtests`
+- `POST /api/backtests`, `/api/backtests/underlying`, `GET /api/backtests`
 
 ## Operational limitations
 

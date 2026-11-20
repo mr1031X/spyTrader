@@ -1,12 +1,15 @@
-"""Closed-candle technical indicators with no forward-looking calculations."""
+"""Closed, regular-session candle technical indicators with no forward-looking calculations."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from datetime import datetime, time as dt_time, timedelta, timezone
+from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+
+ET = ZoneInfo("America/New_York")
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,30 @@ def closed_candles(frame: pd.DataFrame, minutes: int = 1, now: datetime | None =
     return data.loc[closes <= pd.Timestamp(now)].sort_values("timestamp").reset_index(drop=True)
 
 
+def filter_regular_session(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    data = frame.copy()
+    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
+    local = data["timestamp"].dt.tz_convert(ET)
+    times = local.dt.time
+    return data.loc[(times >= dt_time(9, 30)) & (times < dt_time(16, 0))].reset_index(drop=True)
+
+
+def filter_session_candles(frame: pd.DataFrame,
+                           sessions: Iterable[tuple[datetime, datetime]] | None = None) -> pd.DataFrame:
+    if sessions is None:
+        return filter_regular_session(frame)
+    data = frame.copy()
+    if data.empty:
+        return data
+    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
+    keep = pd.Series(False, index=data.index)
+    for opened, closed in sessions:
+        keep |= (data["timestamp"] >= pd.Timestamp(opened)) & (data["timestamp"] < pd.Timestamp(closed))
+    return data.loc[keep].reset_index(drop=True)
+
+
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False, min_periods=length).mean()
 
@@ -69,16 +96,17 @@ def atr(frame: pd.DataFrame, length: int = 14) -> pd.Series:
 
 
 def session_vwap(frame: pd.DataFrame) -> pd.Series:
-    typical = (frame["high"] + frame["low"] + frame["close"]) / 3
-    day = frame["timestamp"].dt.date
-    cumulative_volume = frame["volume"].groupby(day).cumsum().replace(0, np.nan)
-    return (typical * frame["volume"]).groupby(day).cumsum() / cumulative_volume
+    data = filter_regular_session(frame)
+    typical = (data["high"] + data["low"] + data["close"]) / 3
+    day = data["timestamp"].dt.tz_convert(ET).dt.date
+    cumulative_volume = data["volume"].groupby(day).cumsum().replace(0, np.nan)
+    return (typical * data["volume"]).groupby(day).cumsum() / cumulative_volume
 
 
 def compute_indicators(frame: pd.DataFrame, opening_range_minutes: int = 15) -> IndicatorSnapshot:
-    if len(frame) < 55:
-        raise ValueError("At least 55 closed candles are required")
-    data = frame.copy()
+    data = filter_regular_session(frame)
+    if len(data) < 55:
+        raise ValueError("At least 55 closed regular-session candles are required")
     data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
     close = data["close"].astype(float)
     data["ema9"] = ema(close, 9)
@@ -89,9 +117,15 @@ def compute_indicators(frame: pd.DataFrame, opening_range_minutes: int = 15) -> 
     signal_line = macd_line.ewm(span=9, adjust=False, min_periods=9).mean()
     data["atr"] = atr(data)
     data["vwap"] = session_vwap(data)
-    latest_day = data["timestamp"].iloc[-1].date()
-    session = data.loc[data["timestamp"].dt.date == latest_day]
-    opening = session.iloc[:opening_range_minutes]
+    local = data["timestamp"].dt.tz_convert(ET)
+    latest_day = local.iloc[-1].date()
+    session_mask = local.dt.date == latest_day
+    session = data.loc[session_mask]
+    session_open = pd.Timestamp(datetime.combine(latest_day, dt_time(9, 30), tzinfo=ET)).tz_convert(timezone.utc)
+    opening = session.loc[
+        (session["timestamp"] >= session_open)
+        & (session["timestamp"] < session_open + pd.Timedelta(minutes=opening_range_minutes))
+    ]
     if opening.empty:
         opening = session.iloc[:1]
     lookback = data.iloc[-20:]
@@ -125,14 +159,21 @@ def compute_indicators(frame: pd.DataFrame, opening_range_minutes: int = 15) -> 
     )
 
 
-def resample_candles(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
+def resample_candles(frame: pd.DataFrame, minutes: int, now: datetime | None = None) -> pd.DataFrame:
     if frame.empty:
         return frame.copy()
-    data = frame.copy().set_index(pd.to_datetime(frame["timestamp"], utc=True))
-    grouped = data.resample(f"{minutes}min", label="left", closed="left").agg({
-        "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum",
-    }).dropna().reset_index()
-    return grouped
+    data = filter_regular_session(frame)
+    local_dates = data["timestamp"].dt.tz_convert(ET).dt.date
+    pieces = []
+    for _, session in data.groupby(local_dates):
+        grouped = session.set_index("timestamp").resample(
+            f"{minutes}min", label="left", closed="left",
+        ).agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna().reset_index()
+        pieces.append(grouped)
+    if not pieces:
+        return frame.iloc[:0].copy()
+    result = pd.concat(pieces, ignore_index=True).sort_values("timestamp").reset_index(drop=True)
+    return closed_candles(result, minutes, now) if now is not None else result
 
 
 def _finite(value: Any, default: float = 0.0) -> float:

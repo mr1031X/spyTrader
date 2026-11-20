@@ -1,0 +1,983 @@
+diff --git a/backend/database.py b/backend/database.py
+index cc1d3d4..63d1548 100644
+--- a/backend/database.py
++++ b/backend/database.py
+@@ -65,6 +65,29 @@ class SignalRecord(Base):
+     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+ 
+ 
++class OpportunityDiagnosticRecord(Base):
++    __tablename__ = "opportunity_diagnostics"
++    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
++    day: Mapped[date] = mapped_column(Date)
++    mode: Mapped[str] = mapped_column(String(8), index=True)
++    underlying: Mapped[str] = mapped_column(String(16), index=True)
++    scans: Mapped[int] = mapped_column(Integer, default=0)
++    bullish_considered: Mapped[int] = mapped_column(Integer, default=0)
++    bearish_considered: Mapped[int] = mapped_column(Integer, default=0)
++    rejected_signals: Mapped[int] = mapped_column(Integer, default=0)
++    qualified_signals: Mapped[int] = mapped_column(Integer, default=0)
++    contracts_evaluated: Mapped[int] = mapped_column(Integer, default=0)
++    contracts_rejected: Mapped[int] = mapped_column(Integer, default=0)
++    rejection_counts: Mapped[dict] = mapped_column(JSON, default=dict)
++    last_scan: Mapped[dict] = mapped_column(JSON, default=dict)
++    recent_scans: Mapped[list] = mapped_column(JSON, default=list)
++    last_qualifying_signal: Mapped[dict | None] = mapped_column(JSON, nullable=True)
++    last_order_attempt: Mapped[dict | None] = mapped_column(JSON, nullable=True)
++    last_scan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
++    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
++    __table_args__ = (UniqueConstraint("day", "mode", "underlying", name="uq_opportunity_day_symbol"),)
++
++
+ class OrderRecord(Base):
+     __tablename__ = "orders"
+     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+diff --git a/backend/indicators.py b/backend/indicators.py
+index 1eb23a5..377ffee 100644
+--- a/backend/indicators.py
++++ b/backend/indicators.py
+@@ -1,13 +1,16 @@
+-"""Closed-candle technical indicators with no forward-looking calculations."""
++"""Closed, regular-session candle technical indicators with no forward-looking calculations."""
+ from __future__ import annotations
+ 
+ from dataclasses import asdict, dataclass
+-from datetime import datetime, timedelta, timezone
+-from typing import Any
++from datetime import datetime, time as dt_time, timedelta, timezone
++from typing import Any, Iterable
++from zoneinfo import ZoneInfo
+ 
+ import numpy as np
+ import pandas as pd
+ 
++ET = ZoneInfo("America/New_York")
++
+ 
+ @dataclass(frozen=True)
+ class IndicatorSnapshot:
+@@ -43,6 +46,30 @@ def closed_candles(frame: pd.DataFrame, minutes: int = 1, now: datetime | None =
+     return data.loc[closes <= pd.Timestamp(now)].sort_values("timestamp").reset_index(drop=True)
+ 
+ 
++def filter_regular_session(frame: pd.DataFrame) -> pd.DataFrame:
++    if frame.empty:
++        return frame.copy()
++    data = frame.copy()
++    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
++    local = data["timestamp"].dt.tz_convert(ET)
++    times = local.dt.time
++    return data.loc[(times >= dt_time(9, 30)) & (times < dt_time(16, 0))].reset_index(drop=True)
++
++
++def filter_session_candles(frame: pd.DataFrame,
++                           sessions: Iterable[tuple[datetime, datetime]] | None = None) -> pd.DataFrame:
++    if sessions is None:
++        return filter_regular_session(frame)
++    data = frame.copy()
++    if data.empty:
++        return data
++    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
++    keep = pd.Series(False, index=data.index)
++    for opened, closed in sessions:
++        keep |= (data["timestamp"] >= pd.Timestamp(opened)) & (data["timestamp"] < pd.Timestamp(closed))
++    return data.loc[keep].reset_index(drop=True)
++
++
+ def ema(series: pd.Series, length: int) -> pd.Series:
+     return series.ewm(span=length, adjust=False, min_periods=length).mean()
+ 
+@@ -69,10 +96,12 @@ def atr(frame: pd.DataFrame, length: int = 14) -> pd.Series:
+ 
+ 
+ def session_vwap(frame: pd.DataFrame) -> pd.Series:
+-    typical = (frame["high"] + frame["low"] + frame["close"]) / 3
+-    day = frame["timestamp"].dt.date
+-    cumulative_volume = frame["volume"].groupby(day).cumsum().replace(0, np.nan)
+-    return (typical * frame["volume"]).groupby(day).cumsum() / cumulative_volume
++    data = frame.copy()
++    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
++    typical = (data["high"] + data["low"] + data["close"]) / 3
++    day = data["timestamp"].dt.tz_convert(ET).dt.date
++    cumulative_volume = data["volume"].groupby(day).cumsum().replace(0, np.nan)
++    return (typical * data["volume"]).groupby(day).cumsum() / cumulative_volume
+ 
+ 
+ def compute_indicators(frame: pd.DataFrame, opening_range_minutes: int = 15) -> IndicatorSnapshot:
+@@ -89,9 +118,15 @@ def compute_indicators(frame: pd.DataFrame, opening_range_minutes: int = 15) ->
+     signal_line = macd_line.ewm(span=9, adjust=False, min_periods=9).mean()
+     data["atr"] = atr(data)
+     data["vwap"] = session_vwap(data)
+-    latest_day = data["timestamp"].iloc[-1].date()
+-    session = data.loc[data["timestamp"].dt.date == latest_day]
+-    opening = session.iloc[:opening_range_minutes]
++    local = data["timestamp"].dt.tz_convert(ET)
++    latest_day = local.iloc[-1].date()
++    session_mask = local.dt.date == latest_day
++    session = data.loc[session_mask]
++    session_open = pd.Timestamp(datetime.combine(latest_day, dt_time(9, 30), tzinfo=ET)).tz_convert(timezone.utc)
++    opening = session.loc[
++        (session["timestamp"] >= session_open)
++        & (session["timestamp"] < session_open + pd.Timedelta(minutes=opening_range_minutes))
++    ]
+     if opening.empty:
+         opening = session.iloc[:1]
+     lookback = data.iloc[-20:]
+@@ -125,14 +160,22 @@ def compute_indicators(frame: pd.DataFrame, opening_range_minutes: int = 15) ->
+     )
+ 
+ 
+-def resample_candles(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
++def resample_candles(frame: pd.DataFrame, minutes: int, now: datetime | None = None) -> pd.DataFrame:
+     if frame.empty:
+         return frame.copy()
+-    data = frame.copy().set_index(pd.to_datetime(frame["timestamp"], utc=True))
+-    grouped = data.resample(f"{minutes}min", label="left", closed="left").agg({
+-        "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum",
+-    }).dropna().reset_index()
+-    return grouped
++    data = frame.copy()
++    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
++    local_dates = data["timestamp"].dt.tz_convert(ET).dt.date
++    pieces = []
++    for _, session in data.groupby(local_dates):
++        grouped = session.set_index("timestamp").resample(
++            f"{minutes}min", label="left", closed="left",
++        ).agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna().reset_index()
++        pieces.append(grouped)
++    if not pieces:
++        return frame.iloc[:0].copy()
++    result = pd.concat(pieces, ignore_index=True).sort_values("timestamp").reset_index(drop=True)
++    return closed_candles(result, minutes, now) if now is not None else result
+ 
+ 
+ def _finite(value: Any, default: float = 0.0) -> float:
+diff --git a/backend/market_data.py b/backend/market_data.py
+index 4239570..395f706 100644
+--- a/backend/market_data.py
++++ b/backend/market_data.py
+@@ -3,11 +3,10 @@ from __future__ import annotations
+ 
+ import asyncio
+ import threading
+-import time
+ from abc import ABC, abstractmethod
+ from dataclasses import asdict, dataclass
+ from datetime import datetime, timedelta, timezone
+-from typing import Any, Callable
++from typing import Any
+ 
+ import httpx
+ import pandas as pd
+@@ -40,14 +39,18 @@ class Quote:
+     provider: str
+     bid_size: float | None = None
+     ask_size: float | None = None
++    received_at: datetime | None = None
++    timestamp_source: str = "provider"
++    entitlement: str = "real-time"
+ 
+-    def validation_error(self, now: datetime | None = None, max_age_seconds: float = 3, max_spread_percent: float = 8) -> str | None:
++    def validation_error(self, now: datetime | None = None, max_age_seconds: float | None = 3,
++                         max_spread_percent: float | None = 8) -> str | None:
+         now = now or datetime.now(timezone.utc)
+         timestamp = self.timestamp if self.timestamp.tzinfo else self.timestamp.replace(tzinfo=timezone.utc)
+         age = (now - timestamp).total_seconds()
+         if age < -5:
+             return "Quote timestamp is in the future"
+-        if age > max_age_seconds:
++        if max_age_seconds is not None and age > max_age_seconds:
+             return f"Quote is stale ({age:.1f}s old)"
+         if self.bid <= 0 or self.ask <= 0:
+             return "Bid and ask must be positive"
+@@ -57,7 +60,7 @@ class Quote:
+         if midpoint <= 0:
+             return "Invalid midpoint"
+         spread_percent = (self.ask - self.bid) / midpoint * 100
+-        if spread_percent > max_spread_percent:
++        if max_spread_percent is not None and spread_percent > max_spread_percent:
+             return f"Spread {spread_percent:.1f}% exceeds {max_spread_percent:.1f}%"
+         return None
+ 
+@@ -69,11 +72,23 @@ class Quote:
+     def spread_percent(self) -> float:
+         return (self.ask - self.bid) / self.midpoint * 100 if self.midpoint else float("inf")
+ 
++    @property
++    def age_seconds(self) -> float:
++        timestamp = self.timestamp if self.timestamp.tzinfo else self.timestamp.replace(tzinfo=timezone.utc)
++        return (datetime.now(timezone.utc) - timestamp).total_seconds()
++
+     def to_dict(self, now: datetime | None = None) -> dict[str, Any]:
+         timestamp = self.timestamp if self.timestamp.tzinfo else self.timestamp.replace(tzinfo=timezone.utc)
++        received = self.received_at or timestamp
++        if received.tzinfo is None:
++            received = received.replace(tzinfo=timezone.utc)
+         age = ((now or datetime.now(timezone.utc)) - timestamp).total_seconds()
+-        return {**asdict(self), "timestamp": timestamp.isoformat(), "age_seconds": age,
+-                "spread_percent": self.spread_percent, "fresh": 0 <= age <= 3}
++        return {
++            **asdict(self), "timestamp": timestamp.isoformat(), "received_at": received.isoformat(),
++            "provider_timestamp": timestamp.isoformat(), "local_receipt_timestamp": received.isoformat(),
++            "age_seconds": age, "spread_percent": self.spread_percent, "fresh": 0 <= age <= 3,
++            "feed_source": self.provider, "entitlement_status": self.entitlement,
++        }
+ 
+ 
+ @dataclass(frozen=True)
+@@ -108,17 +123,17 @@ class OptionsProvider(ABC):
+ class AlpacaMarketData(OptionsProvider):
+     name = "alpaca_opra"
+ 
+-    def __init__(self, mode: str = "paper", env: Environment | None = None):
++    def __init__(self, mode: str = "paper", env: Environment | None = None, options_enabled: bool = True):
+         self.env = env or get_env()
+         key, secret = self.env.credentials(mode)
+         if not key or not secret:
+             raise DataEntitlementError(f"Alpaca {mode} market-data credentials are not configured")
+-        if self.env.alpaca_options_feed != "opra":
++        if options_enabled and self.env.alpaca_options_feed != "opra":
+             raise DataEntitlementError("Automated execution requires ALPACA_OPTIONS_FEED=opra; indicative data is blocked")
+         self.key = key
+         self.secret = secret
+         self.stock = StockHistoricalDataClient(api_key=key, secret_key=secret)
+-        self.options = OptionHistoricalDataClient(api_key=key, secret_key=secret)
++        self.options = OptionHistoricalDataClient(api_key=key, secret_key=secret) if options_enabled else None
+         self.stock_feed = DataFeed.IEX if self.env.alpaca_stock_feed == "iex" else DataFeed.SIP
+         self.options_feed = OptionsFeed.OPRA
+ 
+@@ -141,13 +156,14 @@ class AlpacaMarketData(OptionsProvider):
+         if item is None:
+             raise MarketDataError(f"No stock quote returned for {symbol}")
+         return Quote(symbol, float(item.bid_price), float(item.ask_price), self._timestamp(item.timestamp),
+-                     self.name, float(item.bid_size or 0), float(item.ask_size or 0))
++                     self.name, float(item.bid_size or 0), float(item.ask_size or 0), datetime.now(timezone.utc))
+ 
+-    def stock_bars(self, symbol: str, timeframe: TimeFrame = TimeFrame.Minute, lookback_minutes: int = 240) -> pd.DataFrame:
+-        end = datetime.now(timezone.utc)
++    def stock_bars(self, symbol: str, timeframe: TimeFrame = TimeFrame.Minute, lookback_minutes: int = 240,
++                   start: datetime | None = None, end: datetime | None = None) -> pd.DataFrame:
++        end = end or datetime.now(timezone.utc)
++        start = start or end - timedelta(minutes=lookback_minutes)
+         request = StockBarsRequest(
+-            symbol_or_symbols=symbol, timeframe=timeframe, start=end - timedelta(minutes=lookback_minutes),
+-            end=end, feed=self.stock_feed,
++            symbol_or_symbols=symbol, timeframe=timeframe, start=start, end=end, feed=self.stock_feed,
+         )
+         response = self._call("stock bars", self.stock.get_stock_bars, request)
+         frame = response.df
+@@ -165,13 +181,16 @@ class AlpacaMarketData(OptionsProvider):
+         return frame.sort_values("timestamp").reset_index(drop=True)
+ 
+     def _snapshots(self, symbols: list[str]) -> dict[str, Any]:
++        if self.options is None:
++            raise DataEntitlementError("Alpaca options data is not enabled for this provider configuration")
+         request = OptionSnapshotRequest(symbol_or_symbols=symbols, feed=self.options_feed)
+         return self._call("OPRA option snapshot", self.options.get_option_snapshot, request)
+ 
+     def _daily_volumes(self, symbols: list[str]) -> dict[str, int]:
+-        """Fetch observed volume separately; current SDK snapshots omit daily bars."""
+         if not symbols:
+             return {}
++        if self.options is None:
++            raise DataEntitlementError("Alpaca options data is not enabled for this provider configuration")
+         end = datetime.now(timezone.utc)
+         request = OptionBarsRequest(
+             symbol_or_symbols=symbols, timeframe=TimeFrame.Day,
+@@ -197,9 +216,9 @@ class AlpacaMarketData(OptionsProvider):
+             raise MarketDataError(f"No OPRA quote returned for {contract.symbol}")
+         quote = Quote(contract.symbol, float(latest.bid_price), float(latest.ask_price),
+                       self._timestamp(latest.timestamp), self.name,
+-                      float(latest.bid_size or 0), float(latest.ask_size or 0))
++                      float(latest.bid_size or 0), float(latest.ask_size or 0), datetime.now(timezone.utc))
+         greeks = item.greeks
+-        daily = getattr(item, "daily_bar", None)  # Compatibility with older alpaca-py snapshots.
++        daily = getattr(item, "daily_bar", None)
+         if volume is None and daily is not None and daily.volume is not None:
+             volume = int(float(daily.volume))
+         open_interest = contract.open_interest
+@@ -211,8 +230,7 @@ class AlpacaMarketData(OptionsProvider):
+             gamma=float(greeks.gamma) if greeks and greeks.gamma is not None else None,
+             theta=float(greeks.theta) if greeks and greeks.theta is not None else None,
+             implied_volatility=float(item.implied_volatility) if item.implied_volatility is not None else None,
+-            open_interest=open_interest,
+-            volume=volume,
++            open_interest=open_interest, volume=volume,
+         )
+ 
+     def option_snapshot(self, contract: OptionContract) -> OptionSnapshot:
+@@ -227,7 +245,6 @@ class AlpacaMarketData(OptionsProvider):
+         return self._convert_snapshot(contract, item, volume)
+ 
+     def option_snapshots(self, contracts: list[OptionContract]) -> list[OptionSnapshot]:
+-        # Batch requests reduce chain-scanning latency while retaining real OPRA quotes.
+         results: list[OptionSnapshot] = []
+         for start in range(0, len(contracts), 50):
+             batch = contracts[start:start + 50]
+@@ -248,7 +265,7 @@ class AlpacaMarketData(OptionsProvider):
+ 
+ 
+ class TradierOptionsProvider(OptionsProvider):
+-    """Production Tradier quotes only; delayed sandbox data is never accepted."""
++    """Production Tradier quotes with provider bid/ask timestamps only."""
+     name = "tradier_production"
+ 
+     def __init__(self, env: Environment | None = None):
+@@ -273,14 +290,31 @@ class TradierOptionsProvider(OptionsProvider):
+             item = item[0] if item else None
+         if not item:
+             raise MarketDataError(f"No Tradier quote returned for {contract.symbol}")
+-        timestamp = datetime.now(timezone.utc)  # Receipt time; provider quote timestamps vary by entitlement.
++        try:
++            bid_time = _tradier_timestamp(item.get("biddate"))
++            ask_time = _tradier_timestamp(item.get("askdate"))
++        except (TypeError, ValueError) as exc:
++            raise MarketDataError(f"Tradier executable bid/ask timestamps are missing: {exc}") from exc
++        timestamp = min(bid_time, ask_time)
+         quote = Quote(contract.symbol, float(item.get("bid") or 0), float(item.get("ask") or 0), timestamp,
+-                      self.name, item.get("bidsize"), item.get("asksize"))
++                      self.name, item.get("bidsize"), item.get("asksize"), datetime.now(timezone.utc))
+         greeks = item.get("greeks") or {}
+         return OptionSnapshot(contract, quote, greeks.get("delta"), greeks.get("gamma"), greeks.get("theta"),
+                               item.get("implied_volatility"), item.get("open_interest"), item.get("volume"))
+ 
+ 
++def _tradier_timestamp(value: Any) -> datetime:
++    if value in (None, "", 0, "0"):
++        raise ValueError("provider timestamp is zero or absent")
++    if isinstance(value, (int, float)) or str(value).replace(".", "", 1).isdigit():
++        numeric = float(value)
++        if numeric > 1e12:
++            numeric /= 1000
++        return datetime.fromtimestamp(numeric, timezone.utc)
++    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
++    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
++
++
+ class QuoteCache:
+     def __init__(self):
+         self._quotes: dict[str, Quote] = {}
+@@ -293,7 +327,8 @@ class QuoteCache:
+             symbol = data.symbol
+             quote = Quote(symbol, float(data.bid_price), float(data.ask_price),
+                           data.timestamp if data.timestamp.tzinfo else data.timestamp.replace(tzinfo=timezone.utc),
+-                          "alpaca_stream", float(data.bid_size or 0), float(data.ask_size or 0))
++                          "alpaca_stream", float(data.bid_size or 0), float(data.ask_size or 0),
++                          datetime.now(timezone.utc))
+             with self._lock:
+                 self._quotes[symbol] = quote
+                 self.connected = True
+@@ -307,7 +342,7 @@ class QuoteCache:
+ 
+ 
+ class AlpacaStreamManager:
+-    """Supervised WebSocket streams; the SDK reconnect loop is wrapped for failures."""
++    """Supervised WebSocket streams; options streaming is provider-specific."""
+     def __init__(self, mode: str, env: Environment | None = None):
+         self.env = env or get_env()
+         self.mode = mode
+@@ -317,19 +352,23 @@ class AlpacaStreamManager:
+         self._stock_stream = None
+         self._option_stream = None
+ 
+-    def start(self, stock_symbols: list[str], option_symbols: list[str] | None = None) -> None:
++    def start(self, stock_symbols: list[str], option_symbols: list[str] | None = None,
++              options_enabled: bool = True) -> None:
+         if self._threads:
+             return
+         key, secret = self.env.credentials(self.mode)
+-        if not key or not secret or self.env.alpaca_options_feed != "opra":
++        if not key or not secret:
+             return
+         feed = DataFeed.IEX if self.env.alpaca_stock_feed == "iex" else DataFeed.SIP
+         self._stock_stream = StockDataStream(key, secret, feed=feed)
+         self._stock_stream.subscribe_quotes(self.cache.update, *stock_symbols)
+-        self._option_stream = OptionDataStream(key, secret, feed=OptionsFeed.OPRA)
+-        if option_symbols:
+-            self._option_stream.subscribe_quotes(self.cache.update, *option_symbols)
+-        for name, stream in (("stock", self._stock_stream), ("option", self._option_stream)):
++        streams = [("stock", self._stock_stream)]
++        if options_enabled and self.env.alpaca_options_feed == "opra":
++            self._option_stream = OptionDataStream(key, secret, feed=OptionsFeed.OPRA)
++            if option_symbols:
++                self._option_stream.subscribe_quotes(self.cache.update, *option_symbols)
++            streams.append(("option", self._option_stream))
++        for name, stream in streams:
+             thread = threading.Thread(target=self._supervise, args=(name, stream), daemon=True, name=f"apex-{name}-stream")
+             thread.start()
+             self._threads.append(thread)
+@@ -362,7 +401,9 @@ class MarketDataService:
+     def __init__(self, settings: BotSettings, env: Environment | None = None):
+         self.settings = settings
+         self.env = env or get_env()
+-        self.alpaca = AlpacaMarketData(settings.trading_mode, self.env)
++        self.alpaca = AlpacaMarketData(
++            settings.trading_mode, self.env, options_enabled=settings.options_provider == "alpaca",
++        )
+         self.options_provider: OptionsProvider = (
+             self.alpaca if settings.options_provider == "alpaca" else TradierOptionsProvider(self.env)
+         )
+@@ -370,8 +411,9 @@ class MarketDataService:
+     def stock_quote(self, symbol: str) -> Quote:
+         return self.alpaca.stock_quote(symbol)
+ 
+-    def stock_bars(self, symbol: str, timeframe: TimeFrame = TimeFrame.Minute, lookback_minutes: int = 240) -> pd.DataFrame:
+-        return self.alpaca.stock_bars(symbol, timeframe, lookback_minutes)
++    def stock_bars(self, symbol: str, timeframe: TimeFrame = TimeFrame.Minute, lookback_minutes: int = 240,
++                   start: datetime | None = None, end: datetime | None = None) -> pd.DataFrame:
++        return self.alpaca.stock_bars(symbol, timeframe, lookback_minutes, start, end)
+ 
+     def option_snapshot(self, contract: OptionContract) -> OptionSnapshot:
+         return self.options_provider.option_snapshot(contract)
+@@ -379,8 +421,10 @@ class MarketDataService:
+     def option_snapshots(self, contracts: list[OptionContract]) -> list[OptionSnapshot]:
+         return self.options_provider.option_snapshots(contracts)
+ 
+-    def validate_quote(self, quote: Quote) -> None:
+-        error = quote.validation_error(max_age_seconds=self.settings.max_quote_age_seconds,
+-                                       max_spread_percent=self.settings.max_spread_percent)
++    def validate_quote(self, quote: Quote, protective: bool = False) -> None:
++        error = quote.validation_error(
++            max_age_seconds=self.settings.max_quote_age_seconds,
++            max_spread_percent=None if protective else self.settings.max_spread_percent,
++        )
+         if error:
+             raise MarketDataError(error)
+diff --git a/backend/risk_manager.py b/backend/risk_manager.py
+index aa21b31..f965126 100644
+--- a/backend/risk_manager.py
++++ b/backend/risk_manager.py
+@@ -31,10 +31,10 @@ class RiskDecision:
+ 
+ 
+ class RiskManager:
+-    def check_entry(self, settings: BotSettings, account: AccountState, daily: DailyState,
+-                    weekly: WeeklyState, open_positions: int, pending_entries: int,
+-                    entries_requested: bool, broker_reconciled: bool, market_open: bool,
+-                    data_ready: bool, now: datetime | None = None) -> RiskDecision:
++    def check_entry_capacity(self, settings: BotSettings, account: AccountState, daily: DailyState,
++                             weekly: WeeklyState, open_positions: int, pending_entries: int,
++                             entries_requested: bool, broker_reconciled: bool, market_open: bool,
++                             now: datetime | None = None) -> RiskDecision:
+         reasons = []
+         if not entries_requested:
+             reasons.append("Automated entries are paused")
+@@ -52,14 +52,25 @@ class RiskManager:
+             reasons.append("Broker state is not reconciled")
+         if not market_open:
+             reasons.append("Market is closed")
+-        if not data_ready:
+-            reasons.append("Real-time execution-quality data is unavailable")
+         if account.blocked or account.trade_blocked or account.options_level < 1:
+             reasons.append("Account or options permission check failed")
+         if now and market_open and not self.entry_time_allowed(settings, now):
+             reasons.append("Past the new-entry cutoff")
+         return RiskDecision(not reasons, reasons)
+ 
++    def check_entry(self, settings: BotSettings, account: AccountState, daily: DailyState,
++                    weekly: WeeklyState, open_positions: int, pending_entries: int,
++                    entries_requested: bool, broker_reconciled: bool, market_open: bool,
++                    data_ready: bool, now: datetime | None = None) -> RiskDecision:
++        decision = self.check_entry_capacity(
++            settings, account, daily, weekly, open_positions, pending_entries,
++            entries_requested, broker_reconciled, market_open, now,
++        )
++        reasons = list(decision.reasons)
++        if not data_ready:
++            reasons.append("Real-time execution-quality data is unavailable")
++        return RiskDecision(not reasons, reasons)
++
+     def position_size(self, score: float, premium: float, multiplier: int, equity: float,
+                       buying_power: float, settings: BotSettings) -> PositionSize:
+         allocation = allocation_for_score(score, settings)
+diff --git a/backend/signal_engine.py b/backend/signal_engine.py
+index 0b35067..57da52f 100644
+--- a/backend/signal_engine.py
++++ b/backend/signal_engine.py
+@@ -1,4 +1,4 @@
+-"""Explainable deterministic 0–100 signal scoring; not a win probability."""
++"""Explainable deterministic 0–100 setup and execution-quality scoring."""
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+@@ -17,14 +17,18 @@ class ScoredSignal:
+     contributions: dict[str, float]
+     explanation: list[str]
+     rejection_reason: str | None = None
++    technical_score: float = 0.0
++    option_quality_score: float = 0.0
+ 
+     def to_dict(self) -> dict[str, Any]:
+         return {
+             "underlying": self.candidate.underlying, "direction": self.candidate.direction,
+             "strategy": self.candidate.strategy, "regime": self.candidate.regime,
+-            "score": self.score, "qualified": self.qualified, "factors": self.factor_scores,
+-            "contributions": self.contributions, "explanation": self.explanation,
+-            "rejection_reason": self.rejection_reason,
++            "trend": self.candidate.trend, "volatility": self.candidate.volatility,
++            "score": self.score, "technical_score": self.technical_score,
++            "option_quality_score": self.option_quality_score, "qualified": self.qualified,
++            "factors": self.factor_scores, "contributions": self.contributions,
++            "explanation": self.explanation, "rejection_reason": self.rejection_reason,
+         }
+ 
+ 
+@@ -32,10 +36,14 @@ class SignalEngine:
+     def score(self, candidate: SignalCandidate, settings: BotSettings,
+               option_liquidity: float = 0.0, reward_risk: float = 0.0) -> ScoredSignal:
+         regime_scores = {
++            "strong bullish": 1.0 if candidate.direction == "call" else 0.25,
++            "moderate bullish": 0.85 if candidate.direction == "call" else 0.35,
++            "strong bearish": 1.0 if candidate.direction == "put" else 0.25,
++            "moderate bearish": 0.85 if candidate.direction == "put" else 0.35,
+             "bullish trending": 1.0 if candidate.direction == "call" else 0.35,
+             "bearish trending": 1.0 if candidate.direction == "put" else 0.35,
+             "sideways": 0.75 if candidate.strategy == "vwap_reversal" else 0.25,
+-            "high volatility": 0.45,
++            "high volatility": 0.75,
+             "low volatility": 0.35,
+             "unstable/news-driven": 0.0,
+         }
+@@ -51,6 +59,8 @@ class SignalEngine:
+         weights = settings.score_weights.model_dump()
+         contributions = {name: round(factors[name] * weights[name], 3) for name in factors}
+         score = round(sum(contributions.values()), 2)
++        technical_score = round(sum(contributions[name] for name in ("momentum", "trend", "volume", "regime", "volatility")), 2)
++        option_quality_score = round(contributions["liquidity"] + contributions["reward_risk"], 2)
+         rejection = None
+         if candidate.stronger_confirmation_required and (
+             factors["momentum"] < 0.7 or factors["volume"] < 0.65
+@@ -59,7 +69,10 @@ class SignalEngine:
+         elif score < settings.min_signal_score:
+             rejection = f"Score {score:.1f} is below the {settings.min_signal_score:.1f} threshold"
+         return ScoredSignal(candidate, score, rejection is None, factors, contributions,
+-                            candidate.explanation, rejection)
++                            candidate.explanation, rejection, technical_score, option_quality_score)
++
++    def score_underlying(self, candidate: SignalCandidate, settings: BotSettings) -> ScoredSignal:
++        return self.score(candidate, settings)
+ 
+ 
+ def allocation_for_score(score: float, settings: BotSettings) -> float:
+diff --git a/backend/strategies.py b/backend/strategies.py
+index ea4c9c0..57eb5e7 100644
+--- a/backend/strategies.py
++++ b/backend/strategies.py
+@@ -1,12 +1,12 @@
+-"""Three deterministic intraday strategies and market-regime classification."""
++"""Explainable intraday breakout, continuation, and VWAP-reversal strategies."""
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from typing import Literal
+ 
+ import pandas as pd
+ 
+-from .indicators import IndicatorSnapshot, compute_indicators
++from .indicators import IndicatorSnapshot, compute_indicators, filter_regular_session
+ 
+ Direction = Literal["call", "put"]
+ 
+@@ -22,23 +22,61 @@ class SignalCandidate:
+     reference_price: float
+     atr: float
+     stronger_confirmation_required: bool = False
++    trend: str = ""
++    volatility: str = "normal"
++    event_key: str | None = None
+ 
+ 
+-def classify_regime(indicators: IndicatorSnapshot, news_unstable: bool = False) -> str:
+-    if news_unstable:
+-        return "unstable/news-driven"
+-    atr_percent = indicators.atr / indicators.price * 100
+-    if atr_percent > 0.8 or indicators.volatility_ratio > 1.8:
+-        return "high volatility"
+-    if indicators.volatility_ratio < 0.55:
+-        return "low volatility"
++@dataclass
++class StrategyEvaluation:
++    strategy: str
++    conditions: dict[str, bool] = field(default_factory=dict)
++    rejected: list[str] = field(default_factory=list)
++    candidate: SignalCandidate | None = None
++    direction: Direction | None = None
++    trend: str = "sideways"
++    volatility: str = "normal"
++
++    def to_dict(self) -> dict:
++        return {
++            "strategy": self.strategy,
++            "conditions": self.conditions,
++            "rejected": self.rejected,
++            "direction": self.direction,
++            "trend": self.trend,
++            "volatility": self.volatility,
++            "candidate": bool(self.candidate),
++            "event_key": self.candidate.event_key if self.candidate else None,
++        }
++
++
++def classify_trend(indicators: IndicatorSnapshot) -> str:
+     if indicators.price > indicators.vwap and indicators.ema21 > indicators.ema50:
+-        return "bullish trending"
++        strong = indicators.ema9 > indicators.ema21 and indicators.macd > indicators.macd_signal
++        return "strong bullish" if strong else "moderate bullish"
+     if indicators.price < indicators.vwap and indicators.ema21 < indicators.ema50:
+-        return "bearish trending"
++        strong = indicators.ema9 < indicators.ema21 and indicators.macd < indicators.macd_signal
++        return "strong bearish" if strong else "moderate bearish"
+     return "sideways"
+ 
+ 
++def classify_volatility(indicators: IndicatorSnapshot, news_unstable: bool = False) -> str:
++    atr_percent = indicators.atr / indicators.price * 100 if indicators.price else 0
++    if news_unstable or atr_percent > 1.6 or indicators.volatility_ratio > 3.0:
++        return "extreme"
++    if atr_percent > 0.8 or indicators.volatility_ratio > 1.8:
++        return "high"
++    if indicators.volatility_ratio < 0.55:
++        return "low"
++    return "normal"
++
++
++def classify_regime(indicators: IndicatorSnapshot, news_unstable: bool = False) -> str:
++    if news_unstable:
++        return "unstable/news-driven"
++    return classify_trend(indicators)
++
++
+ def _momentum(indicators: IndicatorSnapshot, direction: Direction) -> float:
+     signed = indicators.momentum if direction == "call" else -indicators.momentum
+     hist = indicators.macd_histogram if direction == "call" else -indicators.macd_histogram
+@@ -58,99 +96,203 @@ def _trend(indicators: IndicatorSnapshot, direction: Direction) -> float:
+     return score
+ 
+ 
+-def momentum_breakout(underlying: str, one: pd.DataFrame, five: pd.DataFrame, opening_minutes: int) -> SignalCandidate | None:
+-    if len(one) < 55 or len(five) < 55:
+-        return None
++def _volatility_score(indicators: IndicatorSnapshot, target: float) -> float:
++    return max(0.0, 1 - abs(indicators.volatility_ratio - target) / 2.0)
++
++
++def _event_key(frame: pd.DataFrame, setup: str) -> str:
++    return f"{setup}:{pd.Timestamp(frame['timestamp'].iloc[-1]).isoformat()}"
++
++
++def _breakout_detail(underlying: str, one: pd.DataFrame, five: pd.DataFrame,
++                     opening_minutes: int) -> StrategyEvaluation:
++    evaluation = StrategyEvaluation("momentum_breakout")
+     i1 = compute_indicators(one, opening_minutes)
+     i5 = compute_indicators(five, opening_minutes)
++    evaluation.trend = classify_trend(i5)
++    evaluation.volatility = classify_volatility(i5)
+     previous = one.iloc[-2]
+     current = one.iloc[-1]
+     direction: Direction | None = None
+-    reasons: list[str] = []
+     if current["close"] > i1.opening_range_high and previous["close"] <= i1.opening_range_high:
+         direction = "call"
+-        reasons.append("Closed above the opening-range high")
+     elif current["close"] < i1.opening_range_low and previous["close"] >= i1.opening_range_low:
+         direction = "put"
+-        reasons.append("Closed below the opening-range low")
+-    if direction is None or i1.relative_volume < 1.2:
+-        return None
+-    aligned = (i5.ema9 > i5.ema21 > i5.ema50 and i1.price > i1.vwap) if direction == "call" else (
+-        i5.ema9 < i5.ema21 < i5.ema50 and i1.price < i1.vwap)
+-    if not aligned:
+-        return None
+-    extension = abs(i1.price - i1.vwap) / i1.atr
+-    if extension > 2.5:
+-        return None
+-    confirmation = (current["close"] > current["open"] and previous["close"] >= previous["open"]) if direction == "call" else (
+-        current["close"] < current["open"] and previous["close"] <= previous["open"])
+-    if not confirmation:
+-        return None
+-    reasons.extend(["EMA stack and VWAP confirm direction", f"Relative volume {i1.relative_volume:.2f}×", "Entry is not overextended"])
+-    return SignalCandidate(
+-        underlying, direction, "momentum_breakout", classify_regime(i5),
++    evaluation.direction = direction
++    evaluation.conditions["fresh_opening_range_cross"] = direction is not None
++    evaluation.conditions["relative_volume"] = i1.relative_volume >= 1.2
++    if direction is None:
++        evaluation.rejected.append("BREAKOUT_NOT_CONFIRMED")
++    if not evaluation.conditions["relative_volume"]:
++        evaluation.rejected.append("INSUFFICIENT_VOLUME")
++    if direction:
++        ema_aligned = i5.ema9 > i5.ema21 > i5.ema50 if direction == "call" else i5.ema9 < i5.ema21 < i5.ema50
++        vwap_aligned = i1.price > i1.vwap if direction == "call" else i1.price < i1.vwap
++        extension = abs(i1.price - i1.vwap) / i1.atr
++        confirmation = (current["close"] > current["open"] and previous["close"] >= previous["open"]) if direction == "call" else (
++            current["close"] < current["open"] and previous["close"] <= previous["open"])
++        evaluation.conditions.update({
++            "ema_alignment": ema_aligned, "vwap_alignment": vwap_aligned,
++            "not_overextended": extension <= 2.5, "candle_confirmation": confirmation,
++            "atr_expansion": i1.volatility_ratio >= 0.75,
++        })
++        for condition, code in (
++            ("ema_alignment", "EMA_MISALIGNMENT"), ("vwap_alignment", "VWAP_MISALIGNMENT"),
++            ("not_overextended", "OVEREXTENDED_PRICE"), ("candle_confirmation", "BREAKOUT_NOT_CONFIRMED"),
++            ("atr_expansion", "INSUFFICIENT_ATR_EXPANSION"),
++        ):
++            if not evaluation.conditions[condition]:
++                evaluation.rejected.append(code)
++    if evaluation.rejected or direction is None:
++        return evaluation
++    reasons = ["Closed through the opening-range boundary", "EMA stack and VWAP confirm direction",
++               f"Relative volume {i1.relative_volume:.2f}×", "Closed-candle momentum and ATR confirm without overextension"]
++    evaluation.candidate = SignalCandidate(
++        underlying, direction, "momentum_breakout", evaluation.trend,
+         {"momentum": _momentum(i1, direction), "trend": _trend(i5, direction),
+-         "volume": min(i1.relative_volume / 2.5, 1.0), "volatility": max(0, 1 - abs(i1.volatility_ratio - 1.2) / 1.8)},
+-        reasons, i1.price, i1.atr,
++         "volume": min(i1.relative_volume / 2.5, 1.0), "volatility": _volatility_score(i1, 1.2)},
++        reasons, i1.price, i1.atr, trend=evaluation.trend, volatility=evaluation.volatility,
++        event_key=_event_key(one, "opening-range"),
+     )
++    return evaluation
++
+ 
++def momentum_breakout(underlying: str, one: pd.DataFrame, five: pd.DataFrame,
++                      opening_minutes: int) -> SignalCandidate | None:
++    return _breakout_detail(underlying, one, five, opening_minutes).candidate
+ 
+-def trend_continuation(underlying: str, one: pd.DataFrame, five: pd.DataFrame, opening_minutes: int) -> SignalCandidate | None:
+-    if len(one) < 55 or len(five) < 55:
+-        return None
++
++def _continuation_detail(underlying: str, one: pd.DataFrame, five: pd.DataFrame,
++                         opening_minutes: int) -> StrategyEvaluation:
++    evaluation = StrategyEvaluation("trend_continuation")
+     i1 = compute_indicators(one, opening_minutes)
+     i5 = compute_indicators(five, opening_minutes)
+-    recent = five.iloc[-6:-1]
++    evaluation.trend = classify_trend(i5)
++    evaluation.volatility = classify_volatility(i5)
+     direction: Direction | None = None
+-    if i5.ema9 > i5.ema21 > i5.ema50 and i5.price > i5.vwap:
++    if i5.ema9 > i5.ema21 > i5.ema50:
+         direction = "call"
+-        structure = recent["high"].iloc[-1] > recent["high"].iloc[0] and recent["low"].iloc[-1] > recent["low"].iloc[0]
+-        renewed = one["close"].iloc[-1] > one["high"].iloc[-2] and i1.macd_histogram > 0
+-    elif i5.ema9 < i5.ema21 < i5.ema50 and i5.price < i5.vwap:
++    elif i5.ema9 < i5.ema21 < i5.ema50:
+         direction = "put"
+-        structure = recent["high"].iloc[-1] < recent["high"].iloc[0] and recent["low"].iloc[-1] < recent["low"].iloc[0]
+-        renewed = one["close"].iloc[-1] < one["low"].iloc[-2] and i1.macd_histogram < 0
+-    else:
+-        return None
+-    support = i1.ema9 if direction == "call" else i1.ema9
+-    pullback = abs(i1.price - support) <= i1.atr * 0.8 or abs(i1.price - i1.vwap) <= i1.atr * 0.6
+-    if not (structure and pullback and renewed and i1.relative_volume >= 0.8):
+-        return None
+-    return SignalCandidate(
+-        underlying, direction, "trend_continuation", classify_regime(i5),
++    evaluation.direction = direction
++    evaluation.conditions["ema_alignment"] = direction is not None
++    if direction is None:
++        evaluation.rejected.extend(["EMA_MISALIGNMENT", "REGIME_MISMATCH"])
++        return evaluation
++    recent = five.iloc[-6:-1]
++    current = one.iloc[-1]
++    previous = one.iloc[-2]
++    bullish = direction == "call"
++    vwap_aligned = i1.price > i1.vwap if bullish else i1.price < i1.vwap
++    structure = ((recent["high"].iloc[-1] > recent["high"].iloc[0] and recent["low"].iloc[-1] > recent["low"].iloc[0])
++                 if bullish else
++                 (recent["high"].iloc[-1] < recent["high"].iloc[0] and recent["low"].iloc[-1] < recent["low"].iloc[0]))
++    renewed = ((current["close"] > previous["high"] and i1.macd_histogram > 0) if bullish else
++               (current["close"] < previous["low"] and i1.macd_histogram < 0))
++    dynamic_support = abs(i1.price - i1.ema9) <= i1.atr * 0.8 or abs(i1.price - i1.vwap) <= i1.atr * 0.6
++    beyond_opening = ((current["close"] > i1.opening_range_high and recent["high"].max() > i1.opening_range_high)
++                      if bullish else
++                      (current["close"] < i1.opening_range_low and recent["low"].min() < i1.opening_range_low))
++    retest = ((previous["low"] <= i1.opening_range_high + i1.atr * 0.3 and current["close"] > i1.opening_range_high)
++              if bullish else
++              (previous["high"] >= i1.opening_range_low - i1.atr * 0.3 and current["close"] < i1.opening_range_low))
++    consolidation_range = float(recent["high"].iloc[-4:].max() - recent["low"].iloc[-4:].min())
++    consolidation_break = consolidation_range <= i5.atr * 1.8 and (
++        current["close"] > recent["high"].iloc[-4:].max() if bullish else current["close"] < recent["low"].iloc[-4:].min()
++    )
++    structure_break = current["close"] > recent["high"].max() if bullish else current["close"] < recent["low"].min()
++    extension = abs(i1.price - i1.vwap) / i1.atr
++    evaluation.conditions.update({
++        "vwap_alignment": vwap_aligned, "directional_structure": structure,
++        "renewed_momentum": renewed, "pullback_or_dynamic_support": dynamic_support,
++        "confirmed_breakout": beyond_opening, "failed_retest": retest,
++        "consolidation_continuation": consolidation_break, "subsequent_structure_break": structure_break,
++        "relative_volume": i1.relative_volume >= 0.8, "not_overextended": extension <= 2.5,
++    })
++    if not vwap_aligned:
++        evaluation.rejected.append("VWAP_MISALIGNMENT")
++    if not structure:
++        evaluation.rejected.append("TREND_STRUCTURE_MISSING")
++    if not evaluation.conditions["relative_volume"]:
++        evaluation.rejected.append("INSUFFICIENT_VOLUME")
++    if not evaluation.conditions["not_overextended"]:
++        evaluation.rejected.append("OVEREXTENDED_PRICE")
++    trigger = renewed or consolidation_break or structure_break
++    location = dynamic_support or beyond_opening or retest or structure_break
++    evaluation.conditions["continuation_trigger"] = trigger
++    evaluation.conditions["continuation_location"] = location
++    if not trigger:
++        evaluation.rejected.append("CONTINUATION_NOT_CONFIRMED")
++    if not location:
++        evaluation.rejected.append("NO_PULLBACK_OR_FAILED_RETEST")
++    if evaluation.rejected:
++        return evaluation
++    setup = "consolidation" if consolidation_break else ("failed-retest" if retest else ("pullback" if dynamic_support else "structure-break"))
++    evaluation.candidate = SignalCandidate(
++        underlying, direction, "trend_continuation", evaluation.trend,
+         {"momentum": _momentum(i1, direction), "trend": _trend(i5, direction),
+-         "volume": min(i1.relative_volume / 2.0, 1.0), "volatility": max(0, 1 - abs(i1.volatility_ratio - 1.0) / 2)},
+-        ["Established EMA trend and directional price structure", "Pullback held near dynamic support", "Renewed momentum confirmed on a closed candle"],
+-        i1.price, i1.atr,
++         "volume": min(i1.relative_volume / 2.0, 1.0), "volatility": _volatility_score(i1, 1.0)},
++        ["Established EMA trend and directional price structure", f"{setup.replace('-', ' ').title()} confirmed on closed candles",
++         "VWAP, volume, momentum, and extension checks passed"],
++        i1.price, i1.atr, trend=evaluation.trend, volatility=evaluation.volatility,
++        event_key=_event_key(one, setup),
+     )
++    return evaluation
+ 
+ 
+-def vwap_reversal(underlying: str, one: pd.DataFrame, five: pd.DataFrame, opening_minutes: int) -> SignalCandidate | None:
+-    if len(one) < 60 or len(five) < 55:
+-        return None
++def trend_continuation(underlying: str, one: pd.DataFrame, five: pd.DataFrame,
++                       opening_minutes: int) -> SignalCandidate | None:
++    return _continuation_detail(underlying, one, five, opening_minutes).candidate
++
++
++def _vwap_detail(underlying: str, one: pd.DataFrame, five: pd.DataFrame,
++                 opening_minutes: int) -> StrategyEvaluation:
++    evaluation = StrategyEvaluation("vwap_reversal")
+     i1 = compute_indicators(one, opening_minutes)
+     i5 = compute_indicators(five, opening_minutes)
++    evaluation.trend = classify_trend(i5)
++    evaluation.volatility = classify_volatility(i5)
+     previous_vwap = session_vwap_at(one, -2)
+     previous_close = float(one["close"].iloc[-2])
+     direction: Direction | None = None
+     if previous_close < previous_vwap and i1.price > i1.vwap:
+         direction = "call"
+-        momentum_changed = i1.macd_histogram > 0 and i1.rsi > 50
+     elif previous_close > previous_vwap and i1.price < i1.vwap:
+         direction = "put"
+-        momentum_changed = i1.macd_histogram < 0 and i1.rsi < 50
+-    else:
+-        return None
++    evaluation.direction = direction
++    evaluation.conditions["vwap_cross"] = direction is not None
++    if direction is None:
++        evaluation.rejected.append("VWAP_MISALIGNMENT")
++        return evaluation
++    momentum_changed = (i1.macd_histogram > 0 and i1.rsi > 50) if direction == "call" else (i1.macd_histogram < 0 and i1.rsi < 50)
+     failed_breakout = abs(previous_close - previous_vwap) <= i1.atr * 0.5
+-    if not (momentum_changed and failed_breakout and i1.relative_volume >= 1.3):
+-        return None
+-    return SignalCandidate(
+-        underlying, direction, "vwap_reversal", classify_regime(i5),
++    evaluation.conditions.update({
++        "momentum_reversal": momentum_changed, "failed_breakout": failed_breakout,
++        "relative_volume": i1.relative_volume >= 1.3,
++        "not_overextended": abs(i1.price - i1.vwap) / i1.atr <= 2.0,
++    })
++    for condition, code in (
++        ("momentum_reversal", "MOMENTUM_NOT_CONFIRMED"), ("failed_breakout", "FAILED_RETEST_NOT_CONFIRMED"),
++        ("relative_volume", "INSUFFICIENT_VOLUME"), ("not_overextended", "OVEREXTENDED_PRICE"),
++    ):
++        if not evaluation.conditions[condition]:
++            evaluation.rejected.append(code)
++    if evaluation.rejected:
++        return evaluation
++    evaluation.candidate = SignalCandidate(
++        underlying, direction, "vwap_reversal", evaluation.trend,
+         {"momentum": _momentum(i1, direction), "trend": _trend(i5, direction),
+-         "volume": min(i1.relative_volume / 2.5, 1.0), "volatility": max(0, 1 - abs(i1.volatility_ratio - 1.3) / 1.7)},
+-        ["VWAP reclaim/rejection confirmed at candle close", "Prior break failed near VWAP", "Momentum and volume confirm reversal"],
+-        i1.price, i1.atr, stronger_confirmation_required=True,
++         "volume": min(i1.relative_volume / 2.5, 1.0), "volatility": _volatility_score(i1, 1.3)},
++        ["VWAP reclaim/rejection confirmed at candle close", "Prior break failed near VWAP",
++         "Momentum and volume confirm reversal"], i1.price, i1.atr, stronger_confirmation_required=True,
++        trend=evaluation.trend, volatility=evaluation.volatility, event_key=_event_key(one, "vwap-reversal"),
+     )
++    return evaluation
++
++
++def vwap_reversal(underlying: str, one: pd.DataFrame, five: pd.DataFrame,
++                  opening_minutes: int) -> SignalCandidate | None:
++    return _vwap_detail(underlying, one, five, opening_minutes).candidate
+ 
+ 
+ def session_vwap_at(frame: pd.DataFrame, index: int) -> float:
+@@ -164,23 +306,51 @@ class StrategyEngine:
+         "trend_continuation": trend_continuation,
+         "vwap_reversal": vwap_reversal,
+     }
++    DETAILED = {
++        "momentum_breakout": _breakout_detail,
++        "trend_continuation": _continuation_detail,
++        "vwap_reversal": _vwap_detail,
++    }
+ 
+-    def evaluate(self, underlying: str, one: pd.DataFrame, five: pd.DataFrame, fifteen: pd.DataFrame,
+-                 enabled: list[str], opening_minutes: int = 15, news_unstable: bool = False) -> list[SignalCandidate]:
+-        candidates = []
++    def evaluate_detailed(self, underlying: str, one: pd.DataFrame, five: pd.DataFrame, fifteen: pd.DataFrame,
++                          enabled: list[str], opening_minutes: int = 15,
++                          news_unstable: bool = False) -> list[StrategyEvaluation]:
++        one = filter_regular_session(one)
++        five = filter_regular_session(five)
++        fifteen = filter_regular_session(fifteen)
++        results = []
+         for name in enabled:
+-            function = self.STRATEGIES.get(name)
++            function = self.DETAILED.get(name)
+             if not function:
+                 continue
+-            candidate = function(underlying, one, five, opening_minutes)
+-            if candidate is None:
++            if len(one) < 60 or len(five) < 55 or len(fifteen) < 55:
++                results.append(StrategyEvaluation(name, rejected=["INSUFFICIENT_HISTORICAL_DATA"]))
+                 continue
+-            regime = classify_regime(compute_indicators(fifteen, opening_minutes), news_unstable)
+-            compatible = not (
+-                regime == "unstable/news-driven" or
+-                (name == "trend_continuation" and regime == "sideways") or
+-                (name == "momentum_breakout" and regime == "low volatility")
+-            )
+-            if compatible:
+-                candidates.append(SignalCandidate(**{**candidate.__dict__, "regime": regime}))
+-        return candidates
++            evaluation = function(underlying, one, five, opening_minutes)
++            i15 = compute_indicators(fifteen, opening_minutes)
++            trend = classify_trend(i15)
++            volatility = classify_volatility(i15, news_unstable)
++            evaluation.trend = trend
++            evaluation.volatility = volatility
++            if evaluation.candidate is not None:
++                compatible = not (
++                    volatility == "extreme" or
++                    (name == "trend_continuation" and trend == "sideways") or
++                    (name == "momentum_breakout" and volatility == "low")
++                )
++                if compatible:
++                    candidate = evaluation.candidate
++                    evaluation.candidate = SignalCandidate(**{
++                        **candidate.__dict__, "regime": trend, "trend": trend, "volatility": volatility,
++                    })
++                else:
++                    evaluation.rejected.append("UNSTABLE_MARKET" if volatility == "extreme" else "REGIME_MISMATCH")
++                    evaluation.candidate = None
++            results.append(evaluation)
++        return results
++
++    def evaluate(self, underlying: str, one: pd.DataFrame, five: pd.DataFrame, fifteen: pd.DataFrame,
++                 enabled: list[str], opening_minutes: int = 15, news_unstable: bool = False) -> list[SignalCandidate]:
++        return [item.candidate for item in self.evaluate_detailed(
++            underlying, one, five, fifteen, enabled, opening_minutes, news_unstable,
++        ) if item.candidate is not None]

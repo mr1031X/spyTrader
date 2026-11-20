@@ -39,6 +39,8 @@ export interface Settings {
   max_quote_age_seconds: number
   max_spread_percent: number
   max_slippage_percent: number
+  entry_order_timeout_seconds: number
+  exit_order_reprice_seconds: number
   min_absolute_delta: number
   max_absolute_delta: number
   min_open_interest: number
@@ -129,6 +131,7 @@ export interface Status {
   account: Account | null
   clock: { is_open?: boolean; next_open?: string; next_close?: string; timestamp?: string } | null
   data_ready: boolean
+  readiness: DataReadiness | null
   reconciled: boolean
   provider: string | null
   stream_connected: boolean
@@ -140,6 +143,64 @@ export interface Status {
   active_position: Position | null
   latest_signals: Signal[]
   settings: Settings
+}
+
+export interface DataReadiness {
+  broker_connected: boolean
+  underlying_data_ready: boolean
+  historical_data_ready: boolean
+  options_entitlement: boolean
+  option_quotes: boolean
+  order_execution: boolean
+  execution_ready: boolean
+  last_option_quote: string | null
+  last_underlying_bar: Record<string, string>
+  last_completed_candle: Record<string, string>
+}
+
+export interface ScanDecision {
+  timestamp?: string
+  scan_status?: string
+  final_decision?: string
+  price?: number
+  market_data_fresh?: boolean
+  indicator_warmup?: boolean
+}
+
+export interface OpportunitySymbol {
+  underlying: string
+  day: string
+  scans: number
+  bullish_considered: number
+  bearish_considered: number
+  rejected_signals: number
+  qualified_signals: number
+  contracts_evaluated: number
+  contracts_rejected: number
+  primary_rejections: { reason: string; count: number }[]
+  last_scan: ScanDecision
+  last_qualifying_signal: ScanDecision | null
+  last_order_attempt: ScanDecision | null
+  last_scan_at: string | null
+}
+
+export interface OpportunityDiagnostics {
+  symbols: OpportunitySymbol[]
+  readiness: DataReadiness | null
+  last_successful_scan: string | null
+  scan_warning: boolean
+  evaluation_status: string
+  execution: {
+    orders_submitted: number
+    orders_acknowledged: number
+    orders_filled: number
+    orders_canceled: number
+    orders_rejected: number
+    average_execution_latency_seconds: number | null
+    average_estimated_slippage_percent: number | null
+    average_realized_slippage: number | null
+  }
+  updated_at: string
 }
 
 export interface Trade {
@@ -229,6 +290,7 @@ export interface PreflightCheck { name: string; passed: boolean; detail: string 
 export interface Preflight { ready: boolean; checks: PreflightCheck[] }
 
 export interface BacktestResult {
+  replay_type?: 'quotes'
   id: string
   created_at: string
   initial_equity: number
@@ -243,5 +305,46 @@ export interface BacktestResult {
   trades: Record<string, unknown>[]
   equity_curve: number[]
   open_position: Record<string, unknown> | null
+  assumptions: Record<string, unknown>
+}
+
+export interface UnderlyingReplayResult {
+  id: string
+  created_at: string
+  replay_type: 'underlying'
+  symbols: {
+    underlying: string
+    scans: number
+    strategy_evaluations: number
+    candidates: number
+    bullish_candidates: number
+    bearish_candidates: number
+    technical_threshold_met: number
+    rejected_evaluations: number
+    rejected_candidates: number
+    rejection_counts: Record<string, number>
+    threshold_comparison: Record<string, number>
+    primary_rejections: { reason: string; count: number }[]
+    last_candidate: Record<string, unknown> | null
+  }[]
+  evaluation_start: string | null
+  evaluation_end: string | null
+  underlying_bars: number
+  scans_completed: number
+  candidate_count: number
+  decisions: {
+    timestamp: string
+    underlying: string
+    strategy: string
+    direction: 'call' | 'put'
+    trend: string
+    volatility: string
+    technical_score: number
+    raw_technical_points: number
+    threshold_met: boolean
+    rejection_reason: string | null
+    final_decision: string
+  }[]
+  decision_history_limit: number
   assumptions: Record<string, unknown>
 }

@@ -19,8 +19,8 @@ from sqlalchemy.orm import Session
 from .backtesting import BacktestError, Backtester, parse_csv
 from .config import ROOT, BotSettings, get_env
 from .database import (
-    AccountSnapshot, BacktestRecord, DailyState, EventLog, OrderRecord, PositionRecord, SessionLocal,
-    SettingsRecord, SignalRecord, TradeRecord, get_settings, init_db, log_event, save_settings,
+    AccountSnapshot, BacktestRecord, DailyState, EventLog, FillRecord, OpportunityDiagnosticRecord, OrderRecord,
+    PositionRecord, SessionLocal, SettingsRecord, SignalRecord, TradeRecord, get_settings, init_db, log_event, save_settings,
 )
 from .schemas import BacktestParameters, ControlRequest, EmergencyRequest, LiveActivationRequest, ModeRequest
 from .trading_bot import ET, TradingBot
@@ -87,6 +87,35 @@ def create_app() -> FastAPI:
             "daily": _daily_dict(daily), "active_position": _position_dict(position),
             "latest_signals": [_signal_dict(signal) for signal in latest_signals],
             "settings": settings.model_dump(),
+        }
+
+    @app.get("/api/diagnostics")
+    def diagnostics(session: Session = Depends(db)):
+        settings = current_settings(session)
+        now = datetime.now(timezone.utc)
+        items = session.scalars(select(OpportunityDiagnosticRecord).where(
+            OpportunityDiagnosticRecord.day == now.astimezone(ET).date(),
+            OpportunityDiagnosticRecord.mode == settings.trading_mode,
+        ).order_by(OpportunityDiagnosticRecord.underlying)).all()
+        runtime = bot.snapshot()
+        successful_times = [item.last_scan_at for item in items
+                            if (item.last_scan or {}).get("scan_status") == "SCANNED" and item.last_scan_at]
+        last_success = max(successful_times) if successful_times else None
+        if last_success and last_success.tzinfo is None:
+            last_success = last_success.replace(tzinfo=timezone.utc)
+        active_positions = session.scalar(select(func.count(PositionRecord.id)).where(
+            PositionRecord.mode == settings.trading_mode, PositionRecord.status.in_(["open", "closing"]))) or 0
+        scan_warning = bool(
+            runtime.get("entries_enabled") and (runtime.get("clock") or {}).get("is_open")
+            and not active_positions and (last_success is None or (now - last_success).total_seconds() > 120)
+        )
+        return {
+            "symbols": [_diagnostic_dict(item) for item in items],
+            "readiness": runtime.get("readiness"),
+            "last_successful_scan": _iso(last_success), "scan_warning": scan_warning,
+            "evaluation_status": "UNABLE_TO_EVALUATE" if scan_warning else "EVALUATING",
+            "execution": _execution_metrics(session, settings.trading_mode, now),
+            "updated_at": now.isoformat(),
         }
 
     @app.get("/api/settings")
@@ -248,9 +277,13 @@ def create_app() -> FastAPI:
             raise HTTPException(503, "Market data is not configured")
         try:
             quote = await asyncio.to_thread(bot._market.stock_quote, symbol)
-            bars = await asyncio.to_thread(bot._market.stock_bars, symbol)
+            now = datetime.now(timezone.utc)
+            if bot._history:
+                bars = await asyncio.to_thread(bot._history.get, symbol, now)
+            else:
+                bars = await asyncio.to_thread(bot._market.stock_bars, symbol, lookback_minutes=10080)
             from .indicators import closed_candles, compute_indicators
-            closed = closed_candles(bars)
+            closed = closed_candles(bars, now=now)
             indicators = compute_indicators(closed).to_dict() if len(closed) >= 55 else None
             return {"symbol": symbol, "quote": quote.to_dict(), "indicators": indicators,
                     "candles": closed.tail(180).to_dict("records")}
@@ -269,6 +302,22 @@ def create_app() -> FastAPI:
             settings = current_settings(session)
             result = await asyncio.to_thread(Backtester().run, underlying, options, settings,
                                              params.initial_equity, params.slippage_percent, params.fee_per_contract)
+            record = BacktestRecord(name=params.name, parameters=params.model_dump(), results=result)
+            session.add(record)
+            session.commit()
+            return {"id": record.id, "created_at": record.created_at.isoformat(), **result}
+        except (BacktestError, ValidationError, ValueError) as exc:
+            raise HTTPException(422, str(exc))
+
+    @app.post("/api/backtests/underlying")
+    async def run_underlying_backtest(
+        underlying_file: UploadFile = File(...), parameters: str = Form(default="{}"),
+        session: Session = Depends(db),
+    ):
+        try:
+            params = BacktestParameters.model_validate_json(parameters)
+            underlying = parse_csv(await underlying_file.read(), "underlying")
+            result = await asyncio.to_thread(Backtester().run_underlying, underlying, current_settings(session))
             record = BacktestRecord(name=params.name, parameters=params.model_dump(), results=result)
             session.add(record)
             session.commit()
@@ -359,6 +408,63 @@ def _trade_dict(item: TradeRecord):
             "fees": item.fees, "return_percent": item.return_percent, "exit_reason": item.exit_reason,
             "entry_time": _iso(item.entry_time), "exit_time": _iso(item.exit_time),
             "intended_exit_price": item.intended_exit_price, "slippage": item.slippage}
+
+
+def _diagnostic_dict(item: OpportunityDiagnosticRecord):
+    reasons = sorted((item.rejection_counts or {}).items(), key=lambda pair: pair[1], reverse=True)
+    return {
+        "underlying": item.underlying, "day": item.day.isoformat(), "scans": item.scans,
+        "bullish_considered": item.bullish_considered, "bearish_considered": item.bearish_considered,
+        "rejected_signals": item.rejected_signals, "qualified_signals": item.qualified_signals,
+        "contracts_evaluated": item.contracts_evaluated, "contracts_rejected": item.contracts_rejected,
+        "primary_rejections": [{"reason": reason, "count": count} for reason, count in reasons[:8]],
+        "last_scan": item.last_scan, "recent_scans": item.recent_scans,
+        "last_qualifying_signal": item.last_qualifying_signal,
+        "last_order_attempt": item.last_order_attempt,
+        "last_scan_at": _iso(item.last_scan_at),
+    }
+
+
+def _execution_metrics(session: Session, mode: str, now: datetime):
+    day_start = datetime.combine(now.astimezone(ET).date(), datetime.min.time(), tzinfo=ET).astimezone(timezone.utc)
+    orders = session.scalars(select(OrderRecord).where(
+        OrderRecord.mode == mode, OrderRecord.created_at >= day_start,
+    )).all()
+    by_id = {order.id: order for order in orders}
+    fills = session.scalars(select(FillRecord).join(OrderRecord, FillRecord.order_id == OrderRecord.id).where(
+        OrderRecord.mode == mode, FillRecord.created_at >= day_start,
+    )).all()
+    latencies = []
+    for fill in fills:
+        order = by_id.get(fill.order_id)
+        if order:
+            created = order.created_at if order.created_at.tzinfo else order.created_at.replace(tzinfo=timezone.utc)
+            filled = fill.created_at if fill.created_at.tzinfo else fill.created_at.replace(tzinfo=timezone.utc)
+            latencies.append((filled - created).total_seconds())
+    signals = session.scalars(select(SignalRecord).where(
+        SignalRecord.mode == mode, SignalRecord.created_at >= day_start,
+    )).all()
+    estimated = [
+        float(signal.explanation["option"]["estimated_slippage_percent"])
+        for signal in signals
+        if isinstance(signal.explanation, dict)
+        and isinstance(signal.explanation.get("option"), dict)
+        and signal.explanation["option"].get("estimated_slippage_percent") is not None
+    ]
+    trades = session.scalars(select(TradeRecord).where(
+        TradeRecord.mode == mode, TradeRecord.exit_time >= day_start, TradeRecord.slippage.is_not(None),
+    )).all()
+    actual = [trade.slippage for trade in trades if trade.slippage is not None]
+    return {
+        "orders_submitted": len(orders),
+        "orders_acknowledged": sum(order.broker_order_id is not None for order in orders),
+        "orders_filled": sum(order.status == "filled" for order in orders),
+        "orders_canceled": sum(order.status in {"canceled", "expired", "done_for_day"} for order in orders),
+        "orders_rejected": sum(order.status in {"rejected", "error"} for order in orders),
+        "average_execution_latency_seconds": sum(latencies) / len(latencies) if latencies else None,
+        "average_estimated_slippage_percent": sum(estimated) / len(estimated) if estimated else None,
+        "average_realized_slippage": sum(actual) / len(actual) if actual else None,
+    }
 
 
 def _event_dict(item: EventLog):

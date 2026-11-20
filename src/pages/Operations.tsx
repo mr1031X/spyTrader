@@ -3,7 +3,7 @@ import { ArrowRight, Check, CircleAlert, KeyRound, X } from 'lucide-react'
 import { useDashboard } from '@/hooks/use-dashboard'
 import { usePolling } from '@/hooks/use-polling'
 import { formatTime, money, signedMoney, strategyName } from '@/lib/format'
-import type { EventItem, MarketData } from '@/types'
+import type { EventItem, MarketData, OpportunityDiagnostics } from '@/types'
 import { Badge, DataLabel, EmptyState, Metric, PageHeader, Panel, StatusDot } from '@/components/common'
 import PositionPanel from '@/components/PositionPanel'
 
@@ -11,6 +11,7 @@ export default function Operations() {
   const { status } = useDashboard()
   const navigate = useNavigate()
   const { data: events } = usePolling<EventItem[]>('/events', 5000)
+  const { data: diagnostics } = usePolling<OpportunityDiagnostics>('/diagnostics', 5000)
   const settings = status?.settings
   const account = status?.account
   const daily = status?.daily
@@ -37,6 +38,8 @@ export default function Operations() {
         <Metric label="Trade cycles remaining" value={daily && settings ? String(Math.max(0, settings.max_trades_per_day - daily.completed_trades)) : '—'} detail={`${daily?.completed_trades ?? 0} of ${settings?.max_trades_per_day ?? 3} completed`} />
       </div>
 
+      <OpportunityPanel diagnostics={diagnostics} />
+
       <div className="operations-grid">
         <div className="min-w-0 space-y-5">
           <PositionPanel position={status?.active_position ?? null} settings={settings} />
@@ -60,7 +63,9 @@ export default function Operations() {
             <div className="space-y-1">
               <Gate label="Broker authenticated" passed={Boolean(status?.credentials_configured && account)} detail={account ? 'Alpaca account reported' : 'Credentials / connection'} />
               <Gate label="Options permission" passed={Boolean(account && account.options_level > 0 && !account.trade_blocked)} detail={account ? `Approval level ${account.options_level}` : 'Not verified'} />
-              <Gate label="Real-time option data" passed={Boolean(status?.data_ready)} detail={status?.provider || 'OPRA or production Tradier'} />
+              <Gate label="Underlying market data" passed={Boolean(status?.readiness?.underlying_data_ready)} detail="Fresh SPY and QQQ session bars" />
+              <Gate label="Historical indicators" passed={Boolean(status?.readiness?.historical_data_ready)} detail="Calendar-aware multi-session warm-up" />
+              <Gate label="Real-time option data" passed={Boolean(status?.readiness?.option_quotes)} detail={status?.provider || 'OPRA or production Tradier'} />
               <Gate label="Broker state reconciled" passed={Boolean(status?.reconciled)} detail={status?.reconciled ? 'Orders and positions compared' : 'Reconciliation pending'} />
               <Gate label="Regular session" passed={Boolean(status?.clock?.is_open)} detail={status?.clock?.is_open ? 'Market open' : 'Entries wait for next session'} />
             </div>
@@ -86,6 +91,37 @@ export default function Operations() {
       </div>
     </div>
   )
+}
+
+function OpportunityPanel({ diagnostics }: { diagnostics?: OpportunityDiagnostics | null }) {
+  const execution = diagnostics?.execution
+  return <Panel title="Opportunity Diagnostics" subtitle={diagnostics?.last_successful_scan ? `Last successful scan ${formatTime(diagnostics.last_successful_scan)} ET` : 'Waiting for a successful market scan'}
+    action={<Badge tone={diagnostics?.scan_warning ? 'negative' : 'neutral'}>{diagnostics?.scan_warning ? 'Evaluation blocked' : 'Scanner status'}</Badge>}>
+    {diagnostics?.scan_warning && <div className="alert-critical mb-4" role="alert"><CircleAlert size={17} /><span>The market is open, but no scan has completed recently. The bot is unable to evaluate opportunities.</span></div>}
+    <div className="grid gap-3 md:grid-cols-2">
+      {(['SPY', 'QQQ'] as const).map((symbol) => {
+        const item = diagnostics?.symbols.find((entry) => entry.underlying === symbol)
+        return <section className="border border-border bg-background/40 p-4" key={symbol}>
+          <div className="flex items-center justify-between"><strong>{symbol}</strong><Badge tone={item?.qualified_signals ? 'positive' : 'neutral'}>{item?.last_scan?.final_decision?.replaceAll('_', ' ') || 'AWAITING SCAN'}</Badge></div>
+          {item ? <>
+            <div className="mt-4 grid grid-cols-3 gap-3 text-xs"><div><DataLabel>Scans</DataLabel><p className="mt-1 text-lg">{item.scans}</p></div><div><DataLabel>Bull / bear</DataLabel><p className="mt-1 text-lg">{item.bullish_considered} / {item.bearish_considered}</p></div><div><DataLabel>Qualified / rejected</DataLabel><p className="mt-1 text-lg">{item.qualified_signals} / {item.rejected_signals}</p></div></div>
+            <div className="mt-3 flex justify-between gap-3 text-[11px] text-muted-foreground"><span>Last scan {formatTime(item.last_scan_at)} ET</span><span>Contracts {item.contracts_evaluated} evaluated / {item.contracts_rejected} rejected</span></div>
+            <div className="mt-3 flex flex-wrap gap-1">{item.primary_rejections.length ? item.primary_rejections.slice(0, 4).map((reason) => <Badge key={reason.reason} tone="neutral">{reason.reason.replaceAll('_', ' ')} × {reason.count}</Badge>) : <span className="text-xs text-muted-foreground">No strategy or contract rejections recorded.</span>}</div>
+            <div className="mt-3 grid grid-cols-2 gap-3 text-[10px] text-muted-foreground"><span>Last qualifying signal<br />{formatTime(item.last_qualifying_signal?.timestamp)} ET</span><span>Last order attempt<br />{formatTime(item.last_order_attempt?.timestamp)} ET</span></div>
+          </> : <EmptyState title="No scan data" description="This symbol has not completed a scan in the current session." />}
+        </section>
+      })}
+    </div>
+    <div className="mt-4 grid grid-cols-3 gap-px border border-border bg-border text-center sm:grid-cols-6">
+      <ExecutionMetric label="Submitted" value={execution?.orders_submitted} /><ExecutionMetric label="Acknowledged" value={execution?.orders_acknowledged} />
+      <ExecutionMetric label="Filled" value={execution?.orders_filled} /><ExecutionMetric label="Canceled" value={execution?.orders_canceled} />
+      <ExecutionMetric label="Rejected" value={execution?.orders_rejected} /><ExecutionMetric label="Avg fill latency" value={execution?.average_execution_latency_seconds == null ? undefined : `${execution.average_execution_latency_seconds.toFixed(1)}s`} />
+    </div>
+  </Panel>
+}
+
+function ExecutionMetric({ label, value }: { label: string; value?: number | string }) {
+  return <div className="bg-card p-3"><DataLabel>{label}</DataLabel><p className="mt-1 text-sm font-medium">{value ?? '—'}</p></div>
 }
 
 function Gate({ label, passed, detail }: { label: string; passed: boolean; detail: string }) {

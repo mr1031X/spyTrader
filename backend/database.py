@@ -65,6 +65,29 @@ class SignalRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
+class OpportunityDiagnosticRecord(Base):
+    __tablename__ = "opportunity_diagnostics"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    day: Mapped[date] = mapped_column(Date)
+    mode: Mapped[str] = mapped_column(String(8), index=True)
+    underlying: Mapped[str] = mapped_column(String(16), index=True)
+    scans: Mapped[int] = mapped_column(Integer, default=0)
+    bullish_considered: Mapped[int] = mapped_column(Integer, default=0)
+    bearish_considered: Mapped[int] = mapped_column(Integer, default=0)
+    rejected_signals: Mapped[int] = mapped_column(Integer, default=0)
+    qualified_signals: Mapped[int] = mapped_column(Integer, default=0)
+    contracts_evaluated: Mapped[int] = mapped_column(Integer, default=0)
+    contracts_rejected: Mapped[int] = mapped_column(Integer, default=0)
+    rejection_counts: Mapped[dict] = mapped_column(JSON, default=dict)
+    last_scan: Mapped[dict] = mapped_column(JSON, default=dict)
+    recent_scans: Mapped[list] = mapped_column(JSON, default=list)
+    last_qualifying_signal: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    last_order_attempt: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    last_scan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    __table_args__ = (UniqueConstraint("day", "mode", "underlying", name="uq_opportunity_day_symbol"),)
+
+
 class OrderRecord(Base):
     __tablename__ = "orders"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
