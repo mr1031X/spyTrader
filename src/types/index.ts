@@ -34,6 +34,8 @@ export interface Settings {
   overnight_positions: boolean
   min_signal_score: number
   enabled_strategies: string[]
+  experiment_breakout_3_atr_enabled: boolean
+  experiment_confirmed_continuation_enabled: boolean
   score_weights: ScoreWeights
   options_provider: 'alpaca' | 'tradier'
   max_quote_age_seconds: number
@@ -136,6 +138,8 @@ export interface Status {
   provider: string | null
   stream_connected: boolean
   stream_error: string | null
+  last_tick_at: string | null
+  last_scan_at: string | null
   updated_at: string
   credentials_configured: boolean
   options_feed: string

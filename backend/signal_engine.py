@@ -92,7 +92,7 @@ class SignalEngine:
 
 
 def allocation_for_score(score: float, settings: BotSettings) -> float:
-    if score < 80:
+    if score < settings.min_signal_score:
         return 0.0
     if score < 90:
         return settings.min_allocation_percent

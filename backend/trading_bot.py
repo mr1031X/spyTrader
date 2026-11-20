@@ -66,6 +66,8 @@ class TradingBot:
         self._last_account: dict[str, Any] | None = None
         self._clock: dict[str, Any] | None = None
         self._last_scan = 0.0
+        self._last_tick_at: datetime | None = None
+        self._last_scan_at: datetime | None = None
         self._last_reconcile = 0.0
         self._reconciled = False
         self._readiness = ReadinessState()
@@ -196,6 +198,8 @@ class TradingBot:
         if self._entries_enabled and clock.get("is_open") and time.monotonic() - self._last_scan >= 20:
             self._scan_entries(settings, account, now)
             self._last_scan = time.monotonic()
+            self._last_scan_at = now
+        self._last_tick_at = now
 
     def _ensure_periods(self, settings: BotSettings, equity: float, now: datetime) -> None:
         day = now.astimezone(ET).date()
@@ -479,6 +483,7 @@ class TradingBot:
                     payload["rejection_reasons"].extend(selection.rejection_codes)
                     summary["contract_selection"] = contract_details
                 except (MarketDataError, BrokerError, ValueError) as exc:
+                    self._candidate_events.pop(identity, None)
                     self._readiness.option_quotes = False
                     summary["rejection"] = "OPTIONS_DATA_NOT_READY"
                     payload["rejection_reasons"].append("OPTIONS_DATA_NOT_READY")
@@ -564,6 +569,7 @@ class TradingBot:
                     payload["order"] = {"id": order.id, "client_order_id": order.client_order_id,
                                         "symbol": order.symbol, "qty": order.qty}
                 except (MarketDataError, BrokerError, ValueError) as exc:
+                    self._candidate_events.pop(identity, None)
                     payload["final_decision"] = "ORDER_REJECTED"
                     payload["rejection_reasons"].append("ORDER_REJECTED")
                     summary["rejection"] = "ORDER_REJECTED"
@@ -674,7 +680,12 @@ class TradingBot:
             structural = stock_quote.bid > 0 and stock_quote.ask >= stock_quote.bid
             check("stock_data", structural, f"SPY {self.env.alpaca_stock_feed.upper()} quote received")
             contracts = broker.get_contracts("SPY", "call", 1, 3)
-            snapshot = market.option_snapshot(contracts[0]) if contracts else None
+            nearest = min(
+                (contract for contract in contracts if contract.tradable),
+                key=lambda contract: abs(contract.strike - stock_quote.midpoint),
+                default=None,
+            )
+            snapshot = market.option_snapshot(nearest) if nearest else None
             if snapshot is None:
                 check("options_data", False, "No 1–3 DTE SPY option snapshot available")
             else:
@@ -789,6 +800,8 @@ class TradingBot:
                 "provider": self._market.options_provider.name if self._market else None,
                 "stream_connected": self._streams.cache.connected if self._streams else False,
                 "stream_error": self._streams.cache.last_error if self._streams else None,
+                "last_tick_at": self._last_tick_at.isoformat() if self._last_tick_at else None,
+                "last_scan_at": self._last_scan_at.isoformat() if self._last_scan_at else None,
                 "updated_at": utcnow().isoformat(),
             }
 

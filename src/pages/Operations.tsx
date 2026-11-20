@@ -3,7 +3,7 @@ import { ArrowRight, Check, CircleAlert, KeyRound, X } from 'lucide-react'
 import { useDashboard } from '@/hooks/use-dashboard'
 import { usePolling } from '@/hooks/use-polling'
 import { formatTime, money, signedMoney, strategyName } from '@/lib/format'
-import type { EventItem, MarketData, OpportunityDiagnostics } from '@/types'
+import type { EventItem, MarketData, OpportunityDiagnostics, Status } from '@/types'
 import { Badge, DataLabel, EmptyState, Metric, PageHeader, Panel, StatusDot } from '@/components/common'
 import PositionPanel from '@/components/PositionPanel'
 
@@ -21,7 +21,7 @@ export default function Operations() {
   return (
     <div className="page-stack">
       <PageHeader title="Operations" description="Autonomous SPY & QQQ long-options execution with persistent, deterministic risk controls."
-        action={<div className="text-right"><DataLabel>Engine heartbeat</DataLabel><p className="mt-1 text-xs">{status?.updated_at ? `${formatTime(status.updated_at)} ET` : 'Waiting'}</p></div>} />
+        action={<div className="text-right"><DataLabel>Last completed engine tick</DataLabel><p className="mt-1 text-xs">{status?.last_tick_at ? `${formatTime(status.last_tick_at)} ET` : 'Waiting'}</p></div>} />
 
       {status?.state === 'setup_required' && (
         <section className="setup-banner" id="setup">
@@ -59,17 +59,7 @@ export default function Operations() {
         </div>
 
         <aside className="min-w-0 space-y-5">
-          <Panel title="Automation gate" subtitle="Every gate must pass before a new entry">
-            <div className="space-y-1">
-              <Gate label="Broker authenticated" passed={Boolean(status?.credentials_configured && account)} detail={account ? 'Alpaca account reported' : 'Credentials / connection'} />
-              <Gate label="Options permission" passed={Boolean(account && account.options_level > 0 && !account.trade_blocked)} detail={account ? `Approval level ${account.options_level}` : 'Not verified'} />
-              <Gate label="Underlying market data" passed={Boolean(status?.readiness?.underlying_data_ready)} detail="Fresh SPY and QQQ session bars" />
-              <Gate label="Historical indicators" passed={Boolean(status?.readiness?.historical_data_ready)} detail="Calendar-aware multi-session warm-up" />
-              <Gate label="Real-time option data" passed={Boolean(status?.readiness?.option_quotes)} detail={status?.provider || 'OPRA or production Tradier'} />
-              <Gate label="Broker state reconciled" passed={Boolean(status?.reconciled)} detail={status?.reconciled ? 'Orders and positions compared' : 'Reconciliation pending'} />
-              <Gate label="Regular session" passed={Boolean(status?.clock?.is_open)} detail={status?.clock?.is_open ? 'Market open' : 'Entries wait for next session'} />
-            </div>
-          </Panel>
+          {status && <StartupChecklist status={status} scanWarning={Boolean(diagnostics?.scan_warning)} />}
           <Panel title="Daily objective" subtitle={settings?.pause_after_daily_goal ? 'Pause new entries after the goal' : 'Goal tracking only'}>
             <div className="flex items-end justify-between"><strong className={`text-2xl font-medium ${pnlTone === 'negative' ? 'text-negative' : 'text-positive'}`}>{signedMoney(daily?.realized_pnl)}</strong><span className="text-xs text-muted-foreground">/ {money(settings?.daily_profit_goal, 0)}</span></div>
             <div className="progress-track mt-4"><span style={{ width: `${goalProgress}%` }} /></div>
@@ -122,6 +112,43 @@ function OpportunityPanel({ diagnostics }: { diagnostics?: OpportunityDiagnostic
 
 function ExecutionMetric({ label, value }: { label: string; value?: number | string }) {
   return <div className="bg-card p-3"><DataLabel>{label}</DataLabel><p className="mt-1 text-sm font-medium">{value ?? '—'}</p></div>
+}
+
+function StartupChecklist({ status, scanWarning }: { status: Status; scanWarning: boolean }) {
+  const readiness = status.readiness
+  const settings = status.settings
+  const account = status.account
+  const responseTime = Date.parse(status.updated_at)
+  const ageSeconds = (value: string | null) => value ? (responseTime - Date.parse(value)) / 1000 : Number.POSITIVE_INFINITY
+  const heartbeatReady = status.runtime_active && ageSeconds(status.last_tick_at) <= 15
+  const brokerReady = Boolean(status.credentials_configured && readiness?.broker_connected && readiness.order_execution
+    && account && !account.blocked && !account.trade_blocked && account.options_level >= 1)
+  const evaluationReady = Boolean(heartbeatReady && brokerReady && status.reconciled
+    && readiness?.underlying_data_ready && readiness.historical_data_ready && !scanWarning)
+  const optionsConfigured = settings.options_provider === 'tradier' || status.options_feed === 'opra'
+  const optionsReady = Boolean(optionsConfigured && readiness?.options_entitlement && readiness.option_quotes)
+  const experimentsOff = !settings.experiment_breakout_3_atr_enabled && !settings.experiment_confirmed_continuation_enabled
+  const executionReady = evaluationReady && optionsReady && experimentsOff
+  const scanRequired = status.entries_enabled && Boolean(status.clock?.is_open)
+  const scanHealthy = !scanRequired || (!scanWarning && ageSeconds(status.last_scan_at) <= 120)
+
+  return <Panel title="Startup & premarket checklist" subtitle="Evaluation and order execution have independent data gates"
+    action={<div className="flex flex-wrap justify-end gap-1"><Badge tone={evaluationReady ? 'positive' : 'neutral'}>{evaluationReady ? 'Evaluation ready' : 'Evaluation waiting'}</Badge><Badge tone={executionReady ? 'positive' : 'neutral'}>{executionReady ? 'Execution ready' : 'Execution waiting'}</Badge></div>}>
+    <div className="space-y-1">
+      <Gate label="Runtime heartbeat" passed={heartbeatReady} detail={status.last_tick_at ? `Last completed tick ${formatTime(status.last_tick_at)} ET` : 'No completed engine tick'} />
+      <Gate label="Persistent paper environment" passed={status.mode === 'paper' && settings.trading_mode === 'paper' && !settings.live_trading_enabled} detail={`${settings.trading_mode.toUpperCase()} · live authorization off`} />
+      <Gate label="Paper credentials configured" passed={status.credentials_configured} detail="Secrets remain server-side" />
+      <Gate label="Broker and options permission" passed={brokerReady} detail={account ? `Connected · options level ${account.options_level}` : 'Broker account not reported'} />
+      <Gate label="Broker state reconciled" passed={status.reconciled} detail={status.reconciled ? 'Orders and positions compared' : 'Reconciliation pending'} />
+      <Gate label="SPY and QQQ underlying bars" passed={Boolean(readiness?.underlying_data_ready)} detail="Fresh, completed regular-session candles" />
+      <Gate label="Historical indicators" passed={Boolean(readiness?.historical_data_ready)} detail="Calendar-aware multi-session warm-up" />
+      <Gate label="Execution options feed" passed={optionsReady} detail={`${status.provider || settings.options_provider} · ${status.options_feed.toUpperCase()} · ${readiness?.last_option_quote ? `last provider quote ${formatTime(readiness.last_option_quote)} ET` : 'awaiting fresh quote'}`} />
+      <Gate label="Experimental strategies disabled" passed={experimentsOff} detail={experimentsOff ? 'Production strategies only' : 'An experimental entry setup is enabled'} />
+      <Gate label="Automated entries armed" passed={status.entries_enabled} detail={status.entries_enabled ? 'Operator risk acknowledgment completed' : 'Paused until Start / Resume'} />
+      <Gate label="Regular market session" passed={Boolean(status.clock?.is_open)} detail={status.clock?.is_open ? 'Market open' : 'Premarket or closed; execution waits'} />
+      <Gate label="Recent scan loop" passed={scanHealthy} detail={scanRequired ? `Last completed scan ${formatTime(status.last_scan_at)} ET` : 'Not required while paused or closed'} />
+    </div>
+  </Panel>
 }
 
 function Gate({ label, passed, detail }: { label: string; passed: boolean; detail: string }) {

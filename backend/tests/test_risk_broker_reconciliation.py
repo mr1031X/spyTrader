@@ -108,10 +108,17 @@ def test_tick_publishes_broker_clock(monkeypatch, account, daily):
     monkeypatch.setattr(bot, "_manage_positions", lambda settings: None)
     monkeypatch.setattr(bot, "_check_circuits", lambda settings, equity, now: None)
     monkeypatch.setattr(bot, "_handle_eod", lambda settings, clock, now: None)
+    bot._entries_enabled = True
+    scans = []
+    monkeypatch.setattr(bot, "_scan_entries", lambda settings, account, now: scans.append(now))
 
     bot._tick()
 
-    assert bot.snapshot()["clock"] == clock
+    status = bot.snapshot()
+    assert status["clock"] == clock
+    assert status["last_tick_at"] is not None
+    assert status["last_scan_at"] is not None
+    assert len(scans) == 1
 
 
 def test_occ_parser():

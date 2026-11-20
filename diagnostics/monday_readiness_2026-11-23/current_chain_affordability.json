@@ -1,0 +1,106 @@
+{
+  "checked_at": "2026-11-20T23:17:02.762884+00:00",
+  "scope": "Read-only current-chain structural affordability; after-hours quotes are not execution-eligible.",
+  "equity": 9994.87,
+  "options_buying_power": 9994.87,
+  "delta_range": [
+    0.4,
+    0.7
+  ],
+  "allocation_percentages": [
+    5,
+    10,
+    15,
+    20.0
+  ],
+  "chains": [
+    {
+      "symbol": "SPY",
+      "direction": "call",
+      "underlying_midpoint": 692.595,
+      "contracts_discovered": 185,
+      "contracts_considered": 50,
+      "snapshots_received": 50,
+      "structurally_valid_quotes": 50,
+      "delta_passed": 11,
+      "liquidity_passed": 8,
+      "spread_and_slippage_passed": 8,
+      "eligible_before_affordability": 8,
+      "fresh_execution_eligible": 0,
+      "affordable_by_allocation": {
+        "5": 0,
+        "10": 8,
+        "15": 8,
+        "20.0": 8
+      },
+      "minimum_premium_before_affordability": 531.0,
+      "latest_provider_quote": "2026-11-20T21:14:59.989374+00:00"
+    },
+    {
+      "symbol": "SPY",
+      "direction": "put",
+      "underlying_midpoint": 692.595,
+      "contracts_discovered": 185,
+      "contracts_considered": 50,
+      "snapshots_received": 50,
+      "structurally_valid_quotes": 50,
+      "delta_passed": 22,
+      "liquidity_passed": 22,
+      "spread_and_slippage_passed": 20,
+      "eligible_before_affordability": 20,
+      "fresh_execution_eligible": 0,
+      "affordable_by_allocation": {
+        "5": 0,
+        "10": 5,
+        "15": 14,
+        "20.0": 20
+      },
+      "minimum_premium_before_affordability": 765.0,
+      "latest_provider_quote": "2026-11-20T21:14:59.994929+00:00"
+    },
+    {
+      "symbol": "QQQ",
+      "direction": "call",
+      "underlying_midpoint": 614.775,
+      "contracts_discovered": 193,
+      "contracts_considered": 50,
+      "snapshots_received": 50,
+      "structurally_valid_quotes": 50,
+      "delta_passed": 13,
+      "liquidity_passed": 11,
+      "spread_and_slippage_passed": 0,
+      "eligible_before_affordability": 0,
+      "fresh_execution_eligible": 0,
+      "affordable_by_allocation": {
+        "5": 0,
+        "10": 0,
+        "15": 0,
+        "20.0": 0
+      },
+      "minimum_premium_before_affordability": null,
+      "latest_provider_quote": "2026-11-20T21:14:59.998953+00:00"
+    },
+    {
+      "symbol": "QQQ",
+      "direction": "put",
+      "underlying_midpoint": 614.775,
+      "contracts_discovered": 193,
+      "contracts_considered": 50,
+      "snapshots_received": 50,
+      "structurally_valid_quotes": 50,
+      "delta_passed": 28,
+      "liquidity_passed": 27,
+      "spread_and_slippage_passed": 0,
+      "eligible_before_affordability": 0,
+      "fresh_execution_eligible": 0,
+      "affordable_by_allocation": {
+        "5": 0,
+        "10": 0,
+        "15": 0,
+        "20.0": 0
+      },
+      "minimum_premium_before_affordability": null,
+      "latest_provider_quote": "2026-11-20T21:14:59.998849+00:00"
+    }
+  ]
+}

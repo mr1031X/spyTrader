@@ -1,0 +1,27 @@
+{
+  "checked_at": "2026-11-20T23:16:05.274492+00:00",
+  "scope": "Read-only Alpaca Paper account and market-data checks; no orders submitted.",
+  "account": {
+    "mode": "paper",
+    "equity": 9994.87,
+    "options_buying_power": 9994.87,
+    "options_level": 3,
+    "blocked": false,
+    "trade_blocked": false
+  },
+  "structural_preflight": {
+    "ready": true,
+    "checks": [
+      {"name": "credentials", "passed": true},
+      {"name": "broker", "passed": true, "detail": "Connected; options level 3"},
+      {"name": "buying_power", "passed": true, "detail": "Options buying power $9,994.87"},
+      {"name": "stock_data", "passed": true, "detail": "SPY IEX quote received"},
+      {"name": "options_data", "passed": true, "detail": "Quote received; freshness enforced at entry while market is closed"},
+      {"name": "state", "passed": true, "detail": "No unresolved local orders"}
+    ]
+  },
+  "freshness_preflight": {
+    "ready": false,
+    "reason": "The after-hours OPRA quote was stale (7266.6 seconds at check time). Fresh market-open quotes remain mandatory."
+  }
+}

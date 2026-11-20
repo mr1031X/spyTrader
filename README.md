@@ -217,7 +217,7 @@ The test suite uses isolated fake broker responses **only in tests**. It covers 
 
 ### Verification status for this delivery
 
-- Backend suite: **71 passed**. Frontend ESLint, TypeScript compilation, and the Vite production build passed; the PWA build generated 25 static-asset precache entries.
+- Backend suite: **84 passed**. Frontend ESLint, TypeScript compilation, and the Vite production build passed; the PWA build generated 25 static-asset precache entries.
 - An isolated production-server HTTP check loaded the built SPA and JavaScript asset, queried status and diagnostics, and completed an underlying-only replay through the API. It used a temporary database, disabled credentials, and disabled automated entries; no orders were submitted.
 - Read-only Alpaca IEX bars were replayed for November 19 through November 20, 2026 at 18:48 UTC, with earlier bars used only for warm-up. SPY and QQQ each completed 685 scans. One bearish candidate was found for each symbol on November 20: SPY scored 79.21 and QQQ scored 74.69 on the normalized technical scale, both below the unchanged 80 threshold. November 19 produced no candidates. No historical option quotes were available in this check, so no options qualification, fills, or P&L were simulated.
 - Docker image/Compose runtime and browser-layout regression checks were not rerun for this delivery.
